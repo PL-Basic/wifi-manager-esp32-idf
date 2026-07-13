@@ -1,0 +1,454 @@
+#include <string.h>
+#include <stdio.h>
+
+#include "wifi_gateway.h"
+
+#include "esp_log.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+
+
+static const char *TAG = "wifi_gateway";
+
+// 如果外部能直接访问 s_status，就可能绕过 wifi_gateway 模块的规则，随便读写状态。
+static wifi_gateway_status_t s_status = WIFI_GATEWAY_STATUS_IDLE;
+static char s_sta_ip[16] = "0.0.0.0";
+static int s_current_clients = 0;
+
+// getter方法
+wifi_gateway_status_t wifi_gateway_get_status(void)
+{
+    return s_status;
+}
+
+// 将状态转化成字符串
+/*内部状态枚举：适合 C 代码判断
+字符串状态：适合日志、MQTT、JSON、后端阅读 */
+const char *wifi_gateway_status_to_string(wifi_gateway_status_t status)
+{
+    switch (status)
+    {
+    case WIFI_GATEWAY_STATUS_IDLE:
+        return "IDLE";
+    case WIFI_GATEWAY_STATUS_STARTING:
+        return "STARTING";
+    case WIFI_GATEWAY_STATUS_STA_CONNECTING:
+        return "STA_CONNECTING";
+    case WIFI_GATEWAY_STATUS_STA_CONNECTED:
+        return "STA_CONNECTED";
+    case WIFI_GATEWAY_STATUS_STA_GOT_IP:
+        return "STA_GOT_IP";
+    case WIFI_GATEWAY_STATUS_STA_DISCONNECTED:
+        return "STA_DISCONNECTED";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+const char *wifi_gateway_get_sta_ip(void)
+{
+    return s_sta_ip;
+}
+
+int wifi_gateway_get_current_clients(void)
+{
+    return s_current_clients;
+}
+
+
+//配置信息校验
+static esp_err_t validate_config(const wifi_gateway_config_t *config)
+{
+    //判断当前的配置是否为空
+    if (config == NULL)
+    {
+        ESP_LOGE(TAG,"WIFI config is NULL");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    //判断当前的sta_ssid是否为空或为空字符串
+    if (config->sta_ssid == NULL || strlen(config->sta_ssid) == 0)
+    {
+        ESP_LOGE(TAG,"STA SSID is empty");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    //判断当前sta_password是否为空或空字符串
+    if (config->sta_password == NULL || strlen(config->sta_password) == 0)
+    {
+        ESP_LOGE(TAG,"SoftAP password is empty");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    //判断当前的ap_ssid是否为空或为空字符串
+    if (config->ap_ssid == NULL || strlen(config->ap_ssid) == 0)
+    {
+        ESP_LOGE(TAG,"SoftAP SSID is empty");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    //校验SoftAP密码：若密码非空，则长度必须 >= 8（WPA2规范要求）
+    if (config->ap_password != NULL &&
+        strlen(config->ap_password) > 0 && 
+        strlen(config->ap_password) < 8)
+    {
+        ESP_LOGE(TAG,"SoftAP password must be empty or at least 8 characters");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    return ESP_OK;
+}
+
+// 不先 esp_netif_init()，后面就没有准备好 ESP-IDF 网络接口系统，因此创建 STA / AP netif 可能失败。 
+static esp_err_t init_network_stack(void)
+{
+    // 初始化esp_netif
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // 创建默认事件循环
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_event_loop_create_default failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+
+//处理事件函数
+static void wifi_event_handler(void *arg,esp_event_base_t event_base,int32_t event_id,void *event_data)
+{
+    //如果是wifi事件并且事件id还是sta已连接
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED)
+    {
+        s_status = WIFI_GATEWAY_STATUS_STA_CONNECTED;
+        ESP_LOGI(TAG,"STA connected");
+    } 
+    //如果是ip事件并且事件id还为sta获取到ip
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        s_status = WIFI_GATEWAY_STATUS_STA_GOT_IP;
+        snprintf(s_sta_ip,sizeof(s_sta_ip),IPSTR,IP2STR(&event->ip_info.ip));
+        //IPSTR/IPS2STR表示按IPv4格式打印出来
+        ESP_LOGI(TAG,"STA got IP:"IPSTR,IP2STR(&event->ip_info.ip));
+    }
+    //如果是wifi事件并且事件id还为sta未连接
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        s_status = WIFI_GATEWAY_STATUS_STA_DISCONNECTED;
+        snprintf(s_sta_ip, sizeof(s_sta_ip), "0.0.0.0");
+        ESP_LOGW(TAG,"STA disconnected");
+        esp_err_t err = esp_wifi_connect();
+        if (err == ESP_OK)
+        {
+            s_status = WIFI_GATEWAY_STATUS_STA_CONNECTING;
+            ESP_LOGI(TAG, "Reconnect requested");
+        } else {
+            s_status = WIFI_GATEWAY_STATUS_STA_DISCONNECTED;
+            ESP_LOGE(TAG, "Reconnect request failed: %s", esp_err_to_name(err));
+        }
+        
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED)
+    {
+        s_current_clients++;
+        ESP_LOGI(TAG, "SoftAP client connected, current clients: %d", s_current_clients);
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED)
+    {
+        if (s_current_clients > 0)
+        {
+            s_current_clients--;
+        }
+        ESP_LOGI(TAG, "SoftAP client disconnected, current clients: %d",s_current_clients);
+        
+    }
+    
+    
+}
+
+//注册处理方法
+static esp_err_t register_event_handlers(void)
+{
+    // 没创建事件循环前不能注册
+    // 注册wifi事件
+    esp_err_t err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Register failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // 注册ip事件
+    err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Register failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+//wifi驱动初始化
+static esp_err_t init_wifi_driver(void)
+{
+    // 初始化WIFI驱动
+    wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
+    esp_err_t err = esp_wifi_init(&init_config);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // 打印驱动初始化
+    ESP_LOGI(TAG, "WIFI driver initialized");
+
+    return ESP_OK;
+}
+
+//创建wifi接口
+static esp_err_t create_wifi_netifs(esp_netif_t **ap_netif)
+{
+    if (ap_netif == NULL)
+    {
+        ESP_LOGE(TAG, "ap netif output pointer is NULL");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // 为连接别人wifi的sta创建网络接口
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    if (sta_netif == NULL)
+    {
+        ESP_LOGE(TAG, "Create wifi sta failed");
+        return ESP_ERR_ESP_NETIF_INIT_FAILED;
+    }
+
+    // 为自己开热点的SoftAP创建网络接口
+    *ap_netif = esp_netif_create_default_wifi_ap();
+    if (*ap_netif == NULL)
+    {
+        ESP_LOGE(TAG, "Create wifi ap failed");
+        return ESP_ERR_ESP_NETIF_INIT_FAILED;
+    }
+
+    
+    return ESP_OK;
+}
+
+static esp_err_t configure_sta(const wifi_gateway_config_t *config)
+{
+    if (config == NULL)
+    {
+        ESP_LOGE(TAG,"Config is null");
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // 给wifi驱动使用的sta配置结构体赋值
+    // 先将WIFI配置结构体清零
+    wifi_config_t sta_config = {0};
+    strncpy((char *)sta_config.sta.ssid, config->sta_ssid, sizeof(sta_config.sta.ssid) - 1);
+    strncpy((char *)sta_config.sta.password, config->sta_password, sizeof(sta_config.sta.password) - 1);
+
+    // 设置该配置，配置的是驱动中的sta参数
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Set sta config failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t configure_ap(const wifi_gateway_config_t *config)
+{
+    if (config == NULL)
+    {
+        ESP_LOGE(TAG, "Config is null");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 给wifi驱动使用的ap配置结构体赋值
+    // 依旧先清零
+    wifi_config_t ap_config = {0};
+    strncpy((char *)ap_config.ap.ssid, config->ap_ssid, sizeof(ap_config.ap.ssid) - 1);
+    ap_config.ap.ssid_len = strlen(config->ap_ssid);
+    ap_config.ap.channel = 1;
+    ap_config.ap.max_connection = config->ap_max_connection;
+
+    if (config->ap_password != NULL && strlen(config->ap_password) > 0)
+    {
+        strncpy((char *)ap_config.ap.password, config->ap_password, sizeof(ap_config.ap.password) - 1);
+        ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    }
+    else
+    {
+        ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    }
+
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Set ap config failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t enable_softap_napt(esp_netif_t *ap_netif)
+{
+    if (ap_netif == NULL)
+    {
+        ESP_LOGE(TAG, "SoftAP netif is null");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 对下游开放内网接口
+    // 在 SoftAP 这个下游网络接口上开启 IPv4 NAPT 转发能力
+    esp_err_t err = esp_netif_napt_enable(ap_netif);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Open the napt failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "NAPT enabled on SoftAP");
+
+    return ESP_OK;
+}
+
+static esp_err_t set_wifi_mode(void)
+{
+    // 设置WiFi模式
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Set wifi mode failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t start_wifi(void)
+{
+    // 启动WIFI功能
+    esp_err_t err = esp_wifi_start();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "WIFI start failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    ESP_LOGI(TAG, "WIFI started");
+    return ESP_OK;
+}
+
+static esp_err_t connect_sta(void)
+{
+    // 连接wifi
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "WIFI connect request sending failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    s_status = WIFI_GATEWAY_STATUS_STA_CONNECTING;
+    ESP_LOGI(TAG, "STA connect requested");
+    return ESP_OK;
+}
+
+
+
+// wifi启动并连接
+esp_err_t wifi_gateway_start(const wifi_gateway_config_t *config)
+{
+    esp_err_t err = validate_config(config);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    s_status = WIFI_GATEWAY_STATUS_STARTING;
+
+    err = init_network_stack();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = register_event_handlers();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    
+   
+    err = init_wifi_driver();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    
+    esp_netif_t *ap_netif = NULL;
+
+    // 不创建 STA netif，STA 即使发送连接请求，也没有完整的网络接口承接 IP 层能力；
+    // 网关就没有真正的上游网络出口。
+    err = create_wifi_netifs(&ap_netif);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = set_wifi_mode();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = configure_sta(config);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = configure_ap(config);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = start_wifi();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = enable_softap_napt(ap_netif);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    err = connect_sta();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    ESP_LOGI(TAG,"WIFI gateway start placeholder");
+    ESP_LOGI(TAG,"STA SSID: %s",config->sta_ssid);
+    ESP_LOGI(TAG,"SoftAP SSID: %s",config->ap_ssid);
+
+    return ESP_OK;
+}
