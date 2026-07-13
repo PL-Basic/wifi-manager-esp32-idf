@@ -98,3 +98,7 @@ wifi/device/{DEVICE_CODE}/event/status
 ```text
 wifi/device/{DEVICE_CODE}/command/#
 ```
+
+## 开源协议
+
+本项目使用 Apache License 2.0 开源协议，详见 [LICENSE](LICENSE)。
