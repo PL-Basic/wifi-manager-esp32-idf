@@ -1,77 +1,99 @@
 # wifi-manager-esp32-idf
 
-ESP-IDF gateway firmware for Wifi Manager.
+Wifi Manager 项目的 ESP32 网关固件。
 
-This project is the embedded gateway side of the Wifi Manager system. It runs on ESP32 with ESP-IDF through PlatformIO.
+本仓库是 Wifi Manager 系统中的嵌入式网关端，基于 ESP32、ESP-IDF 和 PlatformIO 开发。
 
-Current verified features:
+## 当前已验证功能
 
-- ESP32 STA connects to an upstream WiFi network.
-- ESP32 SoftAP allows downstream clients to connect.
-- IPv4 NAPT forwarding is enabled, so downstream clients can access the Internet through ESP32.
-- Device status is collected and serialized as JSON.
-- Device status is published to MQTT and consumed by the backend.
-- MQTT command topic is subscribed.
-- Downstream MQTT commands can be received by ESP32 and dispatched through a command callback.
+- ESP32 通过 STA 模式连接上游 WiFi。
+- ESP32 通过 SoftAP 模式向下游设备开放热点。
+- 已开启 IPv4 NAPT 转发，下游设备可以通过 ESP32 访问外网。
+- 已采集设备状态，并将设备状态序列化为 JSON。
+- 已通过 MQTT 将设备状态上报到 broker，并被后端消费。
+- 已订阅 MQTT 命令 topic。
+- 已验证 ESP32 能接收下行 MQTT 命令，并通过命令回调分发。
 
-Current stage:
+## 当前阶段
 
-- Status reporting path is verified: ESP32 -> MQTT broker -> backend -> database.
-- Command receiving path is verified: broker/backend -> MQTT -> ESP32.
-- Command execution is not implemented yet. The current command callback only verifies receipt and dispatch.
+- 状态上报链路已验证：
 
-Project structure:
+```text
+ESP32 -> MQTT broker -> 后端 -> 数据库
+```
+
+- 命令下发链路已验证：
+
+```text
+后端 / broker -> MQTT -> ESP32
+```
+
+- 命令执行逻辑尚未实现。当前命令回调只用于验证命令接收和分发。
+
+## 项目结构
 
 ```text
 src/
   main.c
 
 components/
-  app_storage/      NVS initialization
-  wifi_gateway/     STA + SoftAP + NAPT gateway logic
-  device_status/    device status snapshot and JSON serialization
-  app_mqtt/         MQTT connect, publish, subscribe, and command callback
+  app_storage/      NVS 初始化
+  wifi_gateway/     STA + SoftAP + NAPT 网关逻辑
+  device_status/    设备状态快照与 JSON 序列化
+  app_mqtt/         MQTT 连接、发布、订阅与命令回调
 
 include/
   env/
     secrets.example.h
-    secrets.h       local-only config, ignored by git
+    secrets.h       本地私有配置，已被 git 忽略
 ```
 
-Build:
+## 构建
 
 ```powershell
 & 'C:\Users\45333\.platformio\penv\Scripts\platformio.exe' run
 ```
 
-Upload:
+## 烧录
 
 ```powershell
 & 'C:\Users\45333\.platformio\penv\Scripts\platformio.exe' run --target upload
 ```
 
-## Local config
+## 本地配置
 
-Copy `include/env/secrets.example.h` to `include/env/secrets.h` and fill your local WiFi values.
+复制配置模板：
 
-`include/env/secrets.h` is ignored by git.
+```text
+include/env/secrets.example.h
+```
 
-Required local values:
+为：
 
-- upstream WiFi SSID/password
-- ESP32 SoftAP SSID/password
+```text
+include/env/secrets.h
+```
+
+然后填写本地 WiFi、SoftAP、MQTT broker 和设备编号。
+
+`include/env/secrets.h` 已被 `.gitignore` 忽略，不会上传到仓库。
+
+需要配置的本地值：
+
+- 上游 WiFi SSID / 密码
+- ESP32 SoftAP SSID / 密码
 - MQTT broker URI
-- device code
+- 设备编号
 
-## MQTT topics
+## MQTT Topic
 
-Status report:
+设备状态上报：
 
 ```text
 wifi/device/{DEVICE_CODE}/event/status
 ```
 
-Command subscription:
+设备命令订阅：
 
 ```text
 wifi/device/{DEVICE_CODE}/command/#
