@@ -45,7 +45,6 @@ components/
 include/
   env/
     secrets.example.h
-    secrets.h       本地私有配置，已被 git 忽略
 ```
 
 ## 构建
@@ -62,21 +61,11 @@ include/
 
 ## 本地配置
 
-复制配置模板：
 
 ```text
 include/env/secrets.example.h
 ```
 
-为：
-
-```text
-include/env/secrets.h
-```
-
-然后填写本地 WiFi、SoftAP、MQTT broker 和设备编号。
-
-`include/env/secrets.h` 已被 `.gitignore` 忽略，不会上传到仓库。
 
 需要配置的本地值：
 
