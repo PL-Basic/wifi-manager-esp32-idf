@@ -56,6 +56,79 @@ int wifi_gateway_get_current_clients(void)
     return s_current_clients;
 }
 
+// 将 AA:BB:CC:DD:EE:FF 格式的字符串转换成 WiFi 驱动使用的 6 字节 MAC
+static esp_err_t parse_mac_address(const char *mac_text,uint8_t mac[6])
+{
+    if (mac_text == NULL || mac == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 标准mac必须是17个可见字符，并且冒号位置固定
+    if (strlen(mac_text) != 17 || mac_text[2] != ':' || mac_text[5] != ':' || mac_text[8] != ':' || mac_text[11] != ':' || mac_text[14] != ':')
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // sscanf的%x需要unsigned int 指针，不能直接串uint8_t指针
+    unsigned int parts[6] = {0};
+
+    int parsed = sscanf(mac_text,"%2x:%2x:%2x:%2x:%2x:%2x",&parts[0],&parts[1],&parts[2],&parts[3],&parts[4],&parts[5]);
+
+    if (parsed != 6)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    for (int i = 0; i < 6; i++)
+    {
+        if (parts[i] > 0xFF)
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        mac[i] = (uint8_t)parts[i];
+    }
+    
+    return ESP_OK;
+}
+
+// 断开功能
+esp_err_t wifi_gateway_disconnect_client(const char *mac_text)
+{
+    uint8_t mac[6] = {0};
+
+    esp_err_t err = parse_mac_address(mac_text, mac);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Invalid client MAC:%s",mac_text == NULL ? "(null)" : mac_text);
+        return err;
+    }
+
+    //ESP-IDF 断开客户端需要AID，而不是直接使用MAC
+    uint16_t aid = 0;
+    
+    err = esp_wifi_ap_get_sta_aid(mac, &aid);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Get client AID failed,mac=%s: %s",mac_text,esp_err_to_name(err));
+        return err;
+    }
+    
+
+    // 请求WiFi驱动取消该客户端的SoftAP认证
+    err = esp_wifi_deauth_sta(aid);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG,"Disconnect client failed, mac=%s, aid=%u: %s",mac_text,(unsigned)aid,esp_err_to_name(err));
+        
+        return err;
+    }
+    
+    ESP_LOGI(TAG,"Client disconnect requested, mac=%s, aid=%u",mac_text,(unsigned)aid);
+    
+    return ESP_OK;
+}
 
 //配置信息校验
 static esp_err_t validate_config(const wifi_gateway_config_t *config)
@@ -160,17 +233,23 @@ static void wifi_event_handler(void *arg,esp_event_base_t event_base,int32_t eve
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED)
     {
+        const wifi_event_ap_staconnected_t *event = (const wifi_event_ap_staconnected_t *)event_data;
+        
         s_current_clients++;
-        ESP_LOGI(TAG, "SoftAP client connected, current clients: %d", s_current_clients);
+        // 打印真实mac
+        ESP_LOGI(TAG, "SoftAP client connected, mac=%02X:%02X:%02X:%02X:%02X:%02X, aid=%u, current clients=%d", event->mac[0], event->mac[1], event->mac[2], event->mac[3], event->mac[4], event->mac[5], (unsigned)event->aid, s_current_clients);
     }
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED)
     {
+        const wifi_event_ap_stadisconnected_t *event = (const wifi_event_ap_stadisconnected_t *)event_data;
+
         if (s_current_clients > 0)
         {
             s_current_clients--;
         }
-        ESP_LOGI(TAG, "SoftAP client disconnected, current clients: %d",s_current_clients);
-        
+
+        ESP_LOGI(TAG, "SoftAP client disconnected,  mac=%02X:%02X:%02X:%02X:%02X:%02X, aid=%u, current clients=%d", event->mac[0], event->mac[1], event->mac[2], event->mac[3], event->mac[4],event->mac[5], (unsigned)event->aid, s_current_clients);
+    
     }
     
     

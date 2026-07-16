@@ -36,3 +36,5 @@ const char *wifi_gateway_status_to_string(wifi_gateway_status_t status);
 const char *wifi_gateway_get_sta_ip(void);
 // 获取客户端数量方法
 int wifi_gateway_get_current_clients(void);
+// 根据MAC地址断开当前连接到SoftAP的客户端
+esp_err_t wifi_gateway_disconnect_client(const char *mac_text);
