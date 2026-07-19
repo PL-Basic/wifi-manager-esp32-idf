@@ -33,6 +33,8 @@ const char *wifi_gateway_status_to_string(wifi_gateway_status_t status)
         return "IDLE";
     case WIFI_GATEWAY_STATUS_STARTING:
         return "STARTING";
+    case WIFI_GATEWAY_STATUS_PROVISIONING:
+        return "PROVISIONING";
     case WIFI_GATEWAY_STATUS_STA_CONNECTING:
         return "STA_CONNECTING";
     case WIFI_GATEWAY_STATUS_STA_CONNECTED:
@@ -140,18 +142,24 @@ static esp_err_t validate_config(const wifi_gateway_config_t *config)
         return ESP_ERR_INVALID_ARG;
     }
 
-    //判断当前的sta_ssid是否为空或为空字符串
-    if (config->sta_ssid == NULL || strlen(config->sta_ssid) == 0)
+    // 本地配网模式不连接上游路由器，因此不要求STA凭据。
+    // 正常网关模式必须提供一个非空SSID。
+    if (config->sta_enabled)
     {
-        ESP_LOGE(TAG,"STA SSID is empty");
-        return ESP_ERR_INVALID_ARG;
-    }
+        // 判断当前的sta_ssid是否为空或为空字符串
+        if (config->sta_ssid == NULL || strlen(config->sta_ssid) == 0)
+        {
+            ESP_LOGE(TAG, "STA SSID is empty");
+            return ESP_ERR_INVALID_ARG;
+        }
 
-    //判断当前sta_password是否为空或空字符串
-    if (config->sta_password == NULL || strlen(config->sta_password) == 0)
-    {
-        ESP_LOGE(TAG,"SoftAP password is empty");
-        return ESP_ERR_INVALID_ARG;
+        // 上游网络允许开放式WiFi，密码可以是空字符串。
+        // 但调用方不能传NULL，因为后续配置函数会读取它。
+        if (config->sta_password == NULL)
+        {
+            ESP_LOGE(TAG, "STA password is NULL");
+            return ESP_ERR_INVALID_ARG;
+        }
     }
 
     //判断当前的ap_ssid是否为空或为空字符串
@@ -297,23 +305,29 @@ static esp_err_t init_wifi_driver(void)
 }
 
 //创建wifi接口
-static esp_err_t create_wifi_netifs(esp_netif_t **ap_netif)
+static esp_err_t create_wifi_netifs(bool sta_enabled, esp_netif_t **ap_netif)
 {
     if (ap_netif == NULL)
     {
-        ESP_LOGE(TAG, "ap netif output pointer is NULL");
+        ESP_LOGE(TAG, "AP netif output pointer is NULL");
         return ESP_ERR_INVALID_ARG;
     }
-    
-    // 为连接别人wifi的sta创建网络接口
-    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
-    if (sta_netif == NULL)
+
+    // 正常网关模式才需要STA网络接口。
+    // 本地配网模式没有上游连接，不创建无用的STA接口。
+    if (sta_enabled)
     {
-        ESP_LOGE(TAG, "Create wifi sta failed");
-        return ESP_ERR_ESP_NETIF_INIT_FAILED;
+        // 为连接别人wifi的sta创建网络接口
+        esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+        if (sta_netif == NULL)
+        {
+            ESP_LOGE(TAG, "Create wifi sta failed");
+            return ESP_ERR_ESP_NETIF_INIT_FAILED;
+        }
     }
 
-    // 为自己开热点的SoftAP创建网络接口
+    // 两种模式都必须创建SoftAP接口。
+    // 本地Portal、DHCP和客户端连接都依赖该接口。
     *ap_netif = esp_netif_create_default_wifi_ap();
     if (*ap_netif == NULL)
     {
@@ -407,15 +421,20 @@ static esp_err_t enable_softap_napt(esp_netif_t *ap_netif)
     return ESP_OK;
 }
 
-static esp_err_t set_wifi_mode(void)
+static esp_err_t set_wifi_mode(bool sta_enabled)
 {
+    // 正常网关需要AP和STA同时工作
+    // 本地配置只需呀SoftAP
     // 设置WiFi模式
-    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    wifi_mode_t mode = sta_enabled ? WIFI_MODE_APSTA : WIFI_MODE_AP;
+
+    esp_err_t err = esp_wifi_set_mode(mode);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Set wifi mode failed: %s", esp_err_to_name(err));
         return err;
     }
+    ESP_LOGI(TAG, "WiFi mode configured: %s", sta_enabled ? "APSTA" : "AP");
 
     return ESP_OK;
 }
@@ -446,7 +465,6 @@ static esp_err_t connect_sta(void)
     ESP_LOGI(TAG, "STA connect requested");
     return ESP_OK;
 }
-
 
 
 // wifi启动并连接
@@ -483,24 +501,30 @@ esp_err_t wifi_gateway_start(const wifi_gateway_config_t *config)
 
     // 不创建 STA netif，STA 即使发送连接请求，也没有完整的网络接口承接 IP 层能力；
     // 网关就没有真正的上游网络出口。
-    err = create_wifi_netifs(&ap_netif);
+    err = create_wifi_netifs(config->sta_enabled, &ap_netif);
     if (err != ESP_OK)
     {
         return err;
     }
 
-    err = set_wifi_mode();
+    err = set_wifi_mode(config->sta_enabled);
     if (err != ESP_OK)
     {
         return err;
     }
-
-    err = configure_sta(config);
-    if (err != ESP_OK)
+    
+    // 只有存在上游凭据时，才配置STA驱动参数
+    if (config->sta_enabled)
     {
-        return err;
+        err = configure_sta(config);
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+        
     }
-
+    
+    // SoftAP是两种模式的共同入口，因此始终配置
     err = configure_ap(config);
     if (err != ESP_OK)
     {
@@ -513,21 +537,29 @@ esp_err_t wifi_gateway_start(const wifi_gateway_config_t *config)
         return err;
     }
 
-    err = enable_softap_napt(ap_netif);
-    if (err != ESP_OK)
+    if (config->sta_enabled)
     {
-        return err;
-    }
+        err = enable_softap_napt(ap_netif);
+        if (err != ESP_OK)
+        {
+            return err;
+        }
 
-    err = connect_sta();
-    if (err != ESP_OK)
+        err = connect_sta();
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        ESP_LOGI(TAG, "WiFi gateway started, STA SSID=%s, SoftAP SSID=%s", config->sta_ssid, config->ap_ssid);
+    }
+    else
     {
-        return err;
-    }
+        // SoftAP已经可以为管理员提供本地配网页面
+        s_status = WIFI_GATEWAY_STATUS_PROVISIONING;
 
-    ESP_LOGI(TAG,"WIFI gateway start placeholder");
-    ESP_LOGI(TAG,"STA SSID: %s",config->sta_ssid);
-    ESP_LOGI(TAG,"SoftAP SSID: %s",config->ap_ssid);
+        ESP_LOGI(TAG, "WiFi provisioning mode started, SoftAP SSID=%s", config->ap_ssid);
+    }
 
     return ESP_OK;
 }

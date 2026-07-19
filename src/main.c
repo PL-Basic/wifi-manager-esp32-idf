@@ -12,11 +12,15 @@
 #include "device_status.h"
 #include "app_command.h"
 #include "app_mqtt.h"
+#include "client_access.h"
+#include "access_filter.h"
+#include "captive_portal.h"
 
 #include "env/secrets.h"
 
 static void handle_mqtt_command(const char *topic, int topic_len, const char *payload, int payload_len);
 static esp_err_t publish_command_result(const app_command_result_t *result);
+static esp_err_t handle_wifi_provisioning(const char *ssid, const char *password);
 
 // 主题事件状态上发
 #define DEVICE_STATUS_TOPIC "wifi/device/" DEVICE_CODE "/event/status"
@@ -27,13 +31,22 @@ static esp_err_t publish_command_result(const app_command_result_t *result);
 
 static const char *TAG = "app_main";
 
+// 保存从NVS读取的上游WiFi凭据。
+// 必须使用静态存储，因为wifi_config中的指针会指向这两个数组。
+static app_storage_wifi_credentials_t s_wifi_credentials = {0};
 
-wifi_gateway_config_t wifi_config = {
-    .sta_ssid = WIFI_SSID,
-    .sta_password = WIFI_PASSWORD,
+static wifi_gateway_config_t wifi_config = {
+    .sta_enabled = false,
+    .sta_ssid = NULL,
+    .sta_password = NULL,
     .ap_ssid = AP_SSID,
     .ap_password = AP_PASSWORD,
     .ap_max_connection = 4,
+};
+
+static captive_portal_config_t portal_config = {
+    .provisioning_mode = false,
+    .provision_handler = handle_wifi_provisioning,
 };
 
 app_mqtt_config_t mqtt_config = {
@@ -43,6 +56,90 @@ app_mqtt_config_t mqtt_config = {
     .command_handler = handle_mqtt_command,
 };
 
+static esp_err_t handle_wifi_provisioning(const char *ssid, const char *password)
+{
+    if (ssid == NULL || password == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    app_storage_wifi_credentials_t credentials = {0};
+
+    int ssid_written = snprintf(credentials.ssid, sizeof(credentials.ssid),"%s",ssid);
+    if (ssid_written < 0 || (size_t)ssid_written >= sizeof(credentials.ssid))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    int password_written = snprintf(credentials.password, sizeof(credentials.password), "%s", password);
+
+    if (password_written < 0 || (size_t)password_written >= sizeof(credentials.password))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // main只负责调度，真正的NVS写入交给app_storage。
+    return app_storage_save_wifi_credentials(&credentials);
+}
+
+
+// 根据NVS中的上游WiFi凭据，决定网络启动模式
+static esp_err_t prepare_wifi_gateway_config(void)
+{
+    esp_err_t err = app_storage_load_wifi_credentials(&s_wifi_credentials);
+
+    if (err == ESP_OK)
+    {
+        // NVS中存在有效凭据，启动正常网关模式
+        wifi_config.sta_enabled = true;
+        wifi_config.sta_ssid = s_wifi_credentials.ssid;
+        wifi_config.sta_password = s_wifi_credentials.password;
+
+        portal_config.provisioning_mode = false;
+
+        ESP_LOGI(TAG, "Stored upstream WiFi found, normal gateway mode selected");
+
+        return ESP_OK;
+    }
+
+    if (err == ESP_ERR_NOT_FOUND)
+    {
+        // 没有凭据不是程序故障，而是设备尚未完成首次配网
+        wifi_config.sta_enabled = false;
+        wifi_config.sta_ssid = NULL;
+        wifi_config.sta_password = NULL;
+
+        portal_config.provisioning_mode = true;
+
+        ESP_LOGI(TAG, "No stored upstream WiFi, provisioning mode selected");
+
+        return ESP_OK;
+    }
+
+    if (err == ESP_ERR_INVALID_ARG)
+    {
+        // NVS中有数据，但数据不符合当前SSID或密码规则。
+        // 清除无效数据，避免设备每次启动都读取同一份错误配置。
+        ESP_LOGW(TAG, "Stored upstream WiFi is invalid, clearing credentials");
+
+        err = app_storage_clear_wifi_credentials();
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        wifi_config.sta_enabled = false;
+        wifi_config.sta_ssid = NULL;
+        wifi_config.sta_password = NULL;
+
+        portal_config.provisioning_mode = true;
+
+        return ESP_OK;
+    }
+
+    // Flash读取失败等真正的存储异常不能伪装成“尚未配网”。
+    return err;
+}
 
 static esp_err_t publish_device_status(void)
 {
@@ -177,6 +274,26 @@ static void handle_mqtt_command(const char *topic, int topic_len, const char *pa
         break;
 
     case APP_COMMAND_TYPE_ALLOW:
+    {
+        esp_err_t authorize_err = client_access_authorize(request.mac, request.session_id);
+
+        if (authorize_err == ESP_OK)
+        {
+            result.success = true;
+
+            // 当前只修改访问状态，数据包放行将在下一阶段接入
+            snprintf(result.message, sizeof(result.message), "%s", "client access state authorized");
+        }
+        else
+        {
+            result.success = false;
+
+            snprintf(result.message, sizeof(result.message), "authorize client failed: %s", esp_err_to_name(authorize_err));
+        }
+
+        break;
+    }
+
     case APP_COMMAND_TYPE_KICK:
     case APP_COMMAND_TYPE_BLOCK_TRAFFIC:
         // 当前只识别了正式topic，还没有解析各自payload
@@ -212,7 +329,15 @@ void app_main(void)
     ESP_LOGI(TAG,"WiFi gateway booting");
 
     ESP_ERROR_CHECK(app_storage_init_nvs());
+    // 先读取NVS并确定正常网关模式或本地配网模式
+    ESP_ERROR_CHECK(prepare_wifi_gateway_config());
+    // wifi_gateway只负责执行main已经决定好的启动模式
     ESP_ERROR_CHECK(wifi_gateway_start(&wifi_config));
+    ESP_ERROR_CHECK(client_access_start());
+    // client_access状态表启动后，再启动读取该状态表的数据包过滤器
+    ESP_ERROR_CHECK(access_filter_start());
+    // 过滤器保留发往SoftAP本机的流量，因此未认证客户端仍能访问Portal
+    ESP_ERROR_CHECK(captive_portal_start(&portal_config));
 
     bool mqtt_started = false;
 

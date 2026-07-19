@@ -35,13 +35,14 @@ typedef struct
 {
     // 后端命令编号
     char request_id[APP_COMMAND_REQUEST_ID_SIZE];
-
     // 从 topic 识别出的命令类型
     app_command_type_t type;
     // MAC地址
     char mac[APP_COMMAND_MAC_SIZE];  
     // 告警编号
     int64_t alert_id;
+    // 后端为本次认证创建的会话编号
+    int64_t session_id;
 }app_command_request_t;
 
 typedef struct
