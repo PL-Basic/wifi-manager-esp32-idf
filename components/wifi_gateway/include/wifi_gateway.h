@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #include "esp_err.h"
 
@@ -9,6 +10,8 @@ typedef enum
 {
     WIFI_GATEWAY_STATUS_IDLE = 0,
     WIFI_GATEWAY_STATUS_STARTING,
+    // SoftAP已经启动，但设备还没有上游WiFi凭据
+    WIFI_GATEWAY_STATUS_PROVISIONING,
     WIFI_GATEWAY_STATUS_STA_CONNECTING,
     WIFI_GATEWAY_STATUS_STA_CONNECTED,
     WIFI_GATEWAY_STATUS_STA_GOT_IP,
@@ -18,8 +21,13 @@ typedef enum
 //网关启动所需配置
 typedef struct
 {
+    // true：启用STA并尝试连接上游路由器。
+    // false：只启动SoftAP，进入本地配网模式。
+    bool sta_enabled;
+    // 仅当sta_enabled为true时，这两个字段才必须提供。
     const char *sta_ssid;
     const char *sta_password;
+    // 无论哪种模式都需要启动SoftAP，供管理员或客户端连接
     const char *ap_ssid;
     const char *ap_password;
     uint8_t ap_max_connection;

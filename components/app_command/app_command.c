@@ -261,9 +261,32 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
         // 先保存从topic 识别出的命令类型
         // 即使后续payload 解析失败，调用方仍然知道是哪种命令失败
         request->type = topic_command_type;
+        
+        // allow 要求放行指定MAC对应的客户端会话
+        if (topic_command_type == APP_COMMAND_TYPE_ALLOW)
+        {
+            err = read_json_string_field(payload_buffer,"mac",request->mac,sizeof(request->mac));
+            
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Read allow mac failed: %s", esp_err_to_name(err));
 
-        // disconnect-mac 命令必须从payload中读取mac和alertId
-        if (topic_command_type == APP_COMMAND_TYPE_DISCONNECT_MAC)
+                return err;
+            }
+
+            err = read_json_int64_field(payload_buffer,"sessionId",&request->session_id);
+
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Read allow sessionId failed: %s",esp_err_to_name(err));
+             
+                return err;
+            }
+            
+            ESP_LOGI(TAG, "ALLOW parsed mac=%s, sessionId=%lld", request->mac, (long long)request->session_id);
+
+        } // disconnect-mac 命令必须从payload中读取mac和alertId
+        else if (topic_command_type == APP_COMMAND_TYPE_DISCONNECT_MAC)
         {
             // 读取要断开的客户端MAC地址
             err = read_json_string_field(payload_buffer,"mac",request->mac,sizeof(request->mac));
