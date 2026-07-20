@@ -8,6 +8,8 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 
+// 连续出现三次凭据类失败后，才认为可能需要进入恢复模式
+#define STA_CREDENTIAL_FAILURE_LIMIT 3
 
 static const char *TAG = "wifi_gateway";
 
@@ -15,6 +17,33 @@ static const char *TAG = "wifi_gateway";
 static wifi_gateway_status_t s_status = WIFI_GATEWAY_STATUS_IDLE;
 static char s_sta_ip[16] = "0.0.0.0";
 static int s_current_clients = 0;
+// 当前连续出现的STA凭据类失败次数。
+static uint8_t s_sta_credential_failure_count = 0;
+
+static bool is_sta_credential_failure(uint8_t reason)
+{
+    switch (reason)
+    {
+    // 上游路由器拒绝了STA认证。
+    case WIFI_REASON_AUTH_FAIL:
+
+    // WPA/WPA2四次握手没有成功完成。
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+
+    // 企业网络的802.1X认证失败。
+    case WIFI_REASON_802_1X_AUTH_FAILED:
+
+    // 找到了同名热点，但安全模式与当前配置不兼容。
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+        return true;
+
+    // 未识别原因、热点消失或临时网络故障均不直接判定为凭据错误。
+    default:
+        return false;
+    }
+}
 
 // getter方法
 wifi_gateway_status_t wifi_gateway_get_status(void)
@@ -43,6 +72,8 @@ const char *wifi_gateway_status_to_string(wifi_gateway_status_t status)
         return "STA_GOT_IP";
     case WIFI_GATEWAY_STATUS_STA_DISCONNECTED:
         return "STA_DISCONNECTED";
+    case WIFI_GATEWAY_STATUS_STA_RECOVERY_REQUIRED:
+        return "STA_RECOVERY_REQUIRED";
     default:
         return "UNKNOWN";
     }
@@ -210,6 +241,8 @@ static void wifi_event_handler(void *arg,esp_event_base_t event_base,int32_t eve
     //如果是wifi事件并且事件id还是sta已连接
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED)
     {
+        // 已经与上游热点建立WIFI连接，说明当凭据能够完成认证，因此前面的连续凭据失败记录不再有效
+        s_sta_credential_failure_count = 0;
         s_status = WIFI_GATEWAY_STATUS_STA_CONNECTED;
         ESP_LOGI(TAG,"STA connected");
     } 
@@ -225,9 +258,43 @@ static void wifi_event_handler(void *arg,esp_event_base_t event_base,int32_t eve
     //如果是wifi事件并且事件id还为sta未连接
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
-        s_status = WIFI_GATEWAY_STATUS_STA_DISCONNECTED;
+        const wifi_event_sta_disconnected_t *disconnect_event = (const wifi_event_sta_disconnected_t *)event_data;
+        bool recovery_candidate = false;
+        if (disconnect_event != NULL)
+        {
+            bool credential_failure = is_sta_credential_failure(disconnect_event->reason);
+            if (credential_failure)
+            {
+                // 计数达到限制后保持在限制值，避免持续失败导致整数回绕
+                if (s_sta_credential_failure_count < STA_CREDENTIAL_FAILURE_LIMIT)
+                {
+                    s_sta_credential_failure_count++;
+                }
+            }
+
+            recovery_candidate = s_sta_credential_failure_count >= STA_CREDENTIAL_FAILURE_LIMIT;
+            
+            // reason用于区分无热点、认证失败、信号丢失等断线原因
+            // rssi表示断线时的上游WiFi信号强度
+            ESP_LOGW(TAG, "STA disconnected, reason=%u, rssi=%d, credential_failure=%s, credential_failures=%u/%u, recovery_candidate=%s", (unsigned)disconnect_event->reason, (int)disconnect_event->rssi, credential_failure ? "true" : "false", (unsigned)s_sta_credential_failure_count, (unsigned)STA_CREDENTIAL_FAILURE_LIMIT, recovery_candidate ? "true" : "false");
+        }
+        else
+        {
+            ESP_LOGW(TAG, "STA disconnected without event data");
+        }
+
+
         snprintf(s_sta_ip, sizeof(s_sta_ip), "0.0.0.0");
-        ESP_LOGW(TAG,"STA disconnected");
+        if (recovery_candidate)
+        {
+            // 连续凭据失败已经到达限制
+            // 不在继续发送连接请求，等待main.c执行恢复调度
+            s_status = WIFI_GATEWAY_STATUS_STA_RECOVERY_REQUIRED;
+
+            ESP_LOGE(TAG, "STA credential rejected repeatedly, recovery required");
+            return;
+        } 
+        s_status = WIFI_GATEWAY_STATUS_STA_DISCONNECTED;
         esp_err_t err = esp_wifi_connect();
         if (err == ESP_OK)
         {
