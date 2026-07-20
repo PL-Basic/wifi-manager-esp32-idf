@@ -46,7 +46,17 @@ static wifi_gateway_config_t wifi_config = {
 
 static captive_portal_config_t portal_config = {
     .provisioning_mode = false,
+    .external_portal_url = PORTAL_EXTERNAL_URL,
+    .device_code = DEVICE_CODE,
+    // 这两个字段交给Portal内部DNS服务使用
+    .external_portal_domain = PORTAL_EXTERNAL_DOMAIN,
+    .external_portal_ipv4 = PORTAL_SERVER_IPV4,
+    
     .provision_handler = handle_wifi_provisioning,
+};
+
+static access_filter_config_t access_filter_config = {
+    .portal_server_ipv4 = PORTAL_SERVER_IPV4,
 };
 
 app_mqtt_config_t mqtt_config = {
@@ -321,9 +331,6 @@ static void handle_mqtt_command(const char *topic, int topic_len, const char *pa
 }
 
 
-
-
-
 void app_main(void)
 {
     ESP_LOGI(TAG,"WiFi gateway booting");
@@ -335,7 +342,7 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_gateway_start(&wifi_config));
     ESP_ERROR_CHECK(client_access_start());
     // client_access状态表启动后，再启动读取该状态表的数据包过滤器
-    ESP_ERROR_CHECK(access_filter_start());
+    ESP_ERROR_CHECK(access_filter_start(&access_filter_config));
     // 过滤器保留发往SoftAP本机的流量，因此未认证客户端仍能访问Portal
     ESP_ERROR_CHECK(captive_portal_start(&portal_config));
 
