@@ -307,6 +307,49 @@ esp_err_t client_access_get_state(const uint8_t mac[6], client_access_state_t *s
     return ESP_OK;
 }
 
+esp_err_t client_access_get_snapshot_by_ipv4(uint32_t source_ip, client_access_snapshot_t *snapshot)
+{
+    // 0.0.0.0不是有效的客户端地址，snapshot也必须指向有效空间
+    if (source_ip == 0 || snapshot == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 查询失败时，避免调用方拿到之前残留的数据
+    memset(snapshot, 0, sizeof(*snapshot));
+
+    esp_err_t result = ESP_ERR_NOT_FOUND;
+
+    portENTER_CRITICAL(&s_clients_lock);
+
+    for (int i = 0; i < ESP_WIFI_MAX_CONN_NUM; i++)
+    { 
+        // 跳过没有保存客户端的空位置
+        if (!s_clients[i].in_use)
+        {
+            continue;
+        }
+
+        // 当前记录不是请求来源IP，继续寻找
+        if (s_clients[i].ip.addr != source_ip)
+        {
+            continue;
+        }
+
+        // 在锁内复制完整快照，避免读取到更新了一半的数据
+        memcpy(snapshot->mac, s_clients[i].mac, sizeof(snapshot->mac));
+        snapshot->ipv4 = s_clients[i].ip.addr;
+        snapshot->state = s_clients[i].state;
+
+        result = ESP_OK;
+        break;
+    }
+    // 无论是否找到客户端，都必须正常退出临界区
+    portEXIT_CRITICAL(&s_clients_lock);
+
+    return result;
+}
+
 // 根据数据包源IP查询客户端是否具有外网转发权限
 bool client_access_can_forward_ipv4(uint32_t source_ip)
 {
