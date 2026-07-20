@@ -54,6 +54,12 @@ static esp_err_t read_command_type_from_topic(const char *topic, int topic_len, 
         return ESP_OK;
     }
 
+    if (strcmp(command_name, "revoke-access") == 0)
+    {
+        *type = APP_COMMAND_TYPE_REVOKE_ACCESS;
+        return ESP_OK;
+    }
+
     if (strcmp(command_name, "kick") == 0)
     {
         *type = APP_COMMAND_TYPE_KICK;
@@ -200,6 +206,9 @@ const char *app_command_type_to_string(app_command_type_t type)
     case APP_COMMAND_TYPE_ALLOW:
         return "ALLOW";
 
+    case APP_COMMAND_TYPE_REVOKE_ACCESS:
+        return "REVOKE_ACCESS";
+
     case APP_COMMAND_TYPE_KICK:
         return "KICK";
     
@@ -263,14 +272,13 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
         request->type = topic_command_type;
         
         // allow 要求放行指定MAC对应的客户端会话
-        if (topic_command_type == APP_COMMAND_TYPE_ALLOW)
+        if (topic_command_type == APP_COMMAND_TYPE_ALLOW || topic_command_type == APP_COMMAND_TYPE_REVOKE_ACCESS)
         {
             err = read_json_string_field(payload_buffer,"mac",request->mac,sizeof(request->mac));
             
             if (err != ESP_OK)
             {
-                ESP_LOGE(TAG, "Read allow mac failed: %s", esp_err_to_name(err));
-
+                ESP_LOGE(TAG, "Read %s mac failed: %s", app_command_type_to_string(topic_command_type), esp_err_to_name(err));
                 return err;
             }
 
@@ -278,12 +286,11 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
 
             if (err != ESP_OK)
             {
-                ESP_LOGE(TAG, "Read allow sessionId failed: %s",esp_err_to_name(err));
-             
+                ESP_LOGE(TAG, "Read %s sessionId failed: %s", app_command_type_to_string(topic_command_type), esp_err_to_name(err));
                 return err;
             }
-            
-            ESP_LOGI(TAG, "ALLOW parsed mac=%s, sessionId=%lld", request->mac, (long long)request->session_id);
+
+            ESP_LOGI(TAG, "%s parsed, mac=%s, sessionId=%lld", app_command_type_to_string(topic_command_type), request->mac, (long long)request->session_id);
 
         } // disconnect-mac 命令必须从payload中读取mac和alertId
         else if (topic_command_type == APP_COMMAND_TYPE_DISCONNECT_MAC)

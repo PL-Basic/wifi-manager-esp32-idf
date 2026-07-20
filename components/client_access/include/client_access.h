@@ -55,3 +55,5 @@ bool client_access_can_forward_ipv4(uint32_t source_ip);
 const char *client_access_state_to_string(client_access_state_t state);
 // 将指定在线客户端与后端会话绑定，并标记为已认证
 esp_err_t client_access_authorize(const char *mac_text, int64_t session_id);
+// 撤销指定客户端当前会话的认证权限。
+esp_err_t client_access_revoke_authorization(const char *mac_text, int64_t session_id);

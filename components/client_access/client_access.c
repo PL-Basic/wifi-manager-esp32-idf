@@ -10,6 +10,9 @@
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
+#include "esp_netif_net_stack.h"
+#include "lwip/etharp.h"
+#include "lwip/netif.h"
 
 static const char *TAG = "client_access";
 
@@ -18,20 +21,26 @@ typedef struct
 {
     // 当前数组位置是否正在使用
     bool in_use;
-
     // 客户端的六字节 MAC
     uint8_t mac[6];
-
     // 客户端当前访问状态
     client_access_state_t state;
-
     // 当前授权对应的后端会话编号
     int64_t session_id;
-
     // DHCP服务器分配给该客户端的IPv4地址
     esp_ip4_addr_t ip;
-
 } client_access_entry_t;
+
+// 传递给TCP/IP任务的ARP查询参数和查询结果。
+typedef struct
+{
+    // 只查询SoftAP接口的ARP记录。
+    struct netif *netif;
+    // 需要查询的客户端IPv4地址。
+    ip4_addr_t ipv4;
+    // 查询成功后保存对应的六字节MAC。
+    uint8_t mac[6];
+} client_arp_lookup_context_t;
 
 // 使用ESP-IDF当前芯片支持的最大SoftAP客户端数量
 static client_access_entry_t s_clients[ESP_WIFI_MAX_CONN_NUM];
@@ -114,6 +123,8 @@ static esp_err_t track_connected_client(const uint8_t mac[6])
     return ESP_OK;
 }
 
+
+
 // 根据MAC找到在线客户端，并保存DHCP为其分配的IPv4地址
 static esp_err_t track_client_ip(const uint8_t mac[6], const esp_ip4_addr_t *ip)
 {
@@ -141,6 +152,69 @@ static esp_err_t track_client_ip(const uint8_t mac[6], const esp_ip4_addr_t *ip)
 
     ESP_LOGI(TAG,"Client IP tracked, mac=%02X:%02X:%02X:%02X:%02X:%02X, ip=" IPSTR,mac[0],mac[1],mac[2],mac[3],mac[4],mac[5],IP2STR(ip));
 
+    return ESP_OK;
+}
+
+// 补录client_access启动前已经连接SoftAP的客户端。
+static esp_err_t track_existing_softap_clients(void)
+{
+    wifi_sta_list_t station_list = {0};
+
+    // 读取当前已经连接SoftAP的客户端MAC列表
+    esp_err_t err = esp_wifi_ap_get_sta_list(&station_list);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    // 当前没有提交连接的客户端，不需要补录
+    if (station_list.num == 0)
+    {
+        return ESP_OK;
+    }
+
+    // 项目使用的是ESP-IDF默认SoftAP接口。
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap_netif == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // 这个数组同时保存查询输入MAC和查询输出IP。
+    esp_netif_pair_mac_ip_t client_pairs[ESP_WIFI_MAX_CONN_NUM] = {0};
+
+    for (int i = 0; i < station_list.num; i++)
+    {
+        memcpy(client_pairs[i].mac, station_list.sta[i].mac, sizeof(client_pairs[i].mac));
+    }
+    // 根据MAC查询DHCP服务器中已经存在的租约IP。
+    err = esp_netif_dhcps_get_clients_by_mac(ap_netif, station_list.num, client_pairs);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    for (int i = 0; i < station_list.num; i++)
+    {
+        // 首先补录MAC，并将启动时的认证状态设为UNAUTHORIZED。
+        err = track_connected_client(client_pairs[i].mac);
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+
+        // IP为0说明DHCP目前还没完成分配
+        // 这种情况不算启动失败，后续IP事件仍会完成记录
+        if (client_pairs[i].ip.addr != 0)
+        {
+            err = track_client_ip(client_pairs[i].mac, &client_pairs[i].ip);
+
+            if (err != ESP_OK)
+            {
+                return err;
+            }
+        }
+    }
     return ESP_OK;
 }
 
@@ -307,6 +381,115 @@ esp_err_t client_access_get_state(const uint8_t mac[6], client_access_state_t *s
     return ESP_OK;
 }
 
+// 该函数由esp_netif_tcpip_exec()安排到lwIP TCP/IP任务中执行。
+static esp_err_t find_client_mac_in_arp_table(void *context)
+{
+    if (context == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    client_arp_lookup_context_t *lookup =
+        (client_arp_lookup_context_t *)context;
+
+    struct eth_addr *ethernet_address = NULL;
+    const ip4_addr_t *matched_ip = NULL;
+
+    // 根据SoftAP接口和源IPv4地址查找稳定的ARP记录。
+    ssize_t arp_index = etharp_find_addr(
+        lookup->netif,
+        &lookup->ipv4,
+        &ethernet_address,
+        &matched_ip);
+
+    if (arp_index < 0 || ethernet_address == NULL)
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    memcpy(
+        lookup->mac,
+        ethernet_address->addr,
+        sizeof(lookup->mac));
+
+    return ESP_OK;
+}
+
+// 根据实际收到的数据包源IP，从SoftAP的ARP表恢复客户端MAC。
+static esp_err_t resolve_client_mac_by_ipv4(uint32_t source_ip, uint8_t mac[6])
+{
+    if (source_ip == 0 || mac == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+
+    if (ap_netif == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    struct netif *softap_netif = (struct netif *)esp_netif_get_netif_impl(ap_netif);
+
+    if (softap_netif == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    client_arp_lookup_context_t lookup = {
+        .netif = softap_netif,
+        .ipv4 = {
+        .addr = source_ip
+        }
+    };
+
+    // ARP表属于lwIP，必须进入TCP/IP任务中安全查询。
+    esp_err_t err = esp_netif_tcpip_exec(find_client_mac_in_arp_table, &lookup);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    memcpy(mac, lookup.mac, sizeof(lookup.mac));
+
+    return ESP_OK;
+}
+
+// 只查询当前状态表，不执行ARP恢复。
+static esp_err_t copy_client_snapshot_by_ipv4(uint32_t source_ip, client_access_snapshot_t *snapshot)
+{
+    esp_err_t result = ESP_ERR_NOT_FOUND;
+
+    portENTER_CRITICAL(&s_clients_lock);
+
+    for (int i = 0; i < ESP_WIFI_MAX_CONN_NUM; i++)
+    {
+        if (!s_clients[i].in_use)
+        {
+            continue;
+        }
+
+        if (s_clients[i].ip.addr != source_ip)
+        {
+            continue;
+        }
+
+        memcpy(snapshot->mac, s_clients[i].mac, sizeof(snapshot->mac));
+
+        snapshot->ipv4 = s_clients[i].ip.addr;
+        snapshot->state = s_clients[i].state;
+
+        result = ESP_OK;
+        break;
+    }
+
+    portEXIT_CRITICAL(&s_clients_lock);
+
+    return result;
+}
+
 esp_err_t client_access_get_snapshot_by_ipv4(uint32_t source_ip, client_access_snapshot_t *snapshot)
 {
     // 0.0.0.0不是有效的客户端地址，snapshot也必须指向有效空间
@@ -318,36 +501,36 @@ esp_err_t client_access_get_snapshot_by_ipv4(uint32_t source_ip, client_access_s
     // 查询失败时，避免调用方拿到之前残留的数据
     memset(snapshot, 0, sizeof(*snapshot));
 
-    esp_err_t result = ESP_ERR_NOT_FOUND;
-
-    portENTER_CRITICAL(&s_clients_lock);
-
-    for (int i = 0; i < ESP_WIFI_MAX_CONN_NUM; i++)
-    { 
-        // 跳过没有保存客户端的空位置
-        if (!s_clients[i].in_use)
-        {
-            continue;
-        }
-
-        // 当前记录不是请求来源IP，继续寻找
-        if (s_clients[i].ip.addr != source_ip)
-        {
-            continue;
-        }
-
-        // 在锁内复制完整快照，避免读取到更新了一半的数据
-        memcpy(snapshot->mac, s_clients[i].mac, sizeof(snapshot->mac));
-        snapshot->ipv4 = s_clients[i].ip.addr;
-        snapshot->state = s_clients[i].state;
-
-        result = ESP_OK;
-        break;
+    // 首先走正常状态表查询。
+    esp_err_t err = copy_client_snapshot_by_ipv4(source_ip, snapshot);
+    if (err == ESP_OK)
+    {
+        return ESP_OK;
     }
-    // 无论是否找到客户端，都必须正常退出临界区
-    portEXIT_CRITICAL(&s_clients_lock);
 
-    return result;
+    // DHCP事件可能没有出现，尝试从实际网络通信产生的ARP表恢复MAC。
+    uint8_t recovered_mac[6] = {0};
+    err = resolve_client_mac_by_ipv4(source_ip, recovered_mac);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    esp_ip4_addr_t recovered_ip = {
+        .addr = source_ip
+    };
+
+    // 这里只能给已经通过WiFi连接事件记录的MAC补充IP。
+    // 陌生ARP记录不能凭空创建已连接客户端。
+    err = track_client_ip(recovered_mac, &recovered_ip);
+
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    // IP恢复完成后，重新读取一份完整快照。
+    return copy_client_snapshot_by_ipv4(source_ip, snapshot);
 }
 
 // 根据数据包源IP查询客户端是否具有外网转发权限
@@ -449,6 +632,61 @@ esp_err_t client_access_authorize(const char *mac_text, int64_t session_id)
     return ESP_OK;
 }
 
+// 撤销指定客户端当前会话的认证权限
+esp_err_t client_access_revoke_authorization(const char *mac_text, int64_t session_id)
+{
+    // sessionId必须是后端创建的有效正数编号
+    if (session_id <= 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 将字符串形式的MAC转换为内部使用的六字节MAC
+    uint8_t mac[6] = {0};
+    esp_err_t err = parse_mac_address(mac_text, mac);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    int client_index = -1;
+    bool revoked = false;
+
+    portENTER_CRITICAL(&s_clients_lock);
+
+    client_index = find_client_index_locked(mac);
+
+    // 只有MAC、当前状态和sessionId全部匹配，
+    // 才能撤销这一次真实存在的认证会话。
+    if (client_index >= 0 && s_clients[client_index].state == CLIENT_ACCESS_STATE_AUTHORIZED && s_clients[client_index].session_id == session_id)
+    {
+        s_clients[client_index].state = CLIENT_ACCESS_STATE_UNAUTHORIZED;
+        // 当前会话已经失效，不能继续保留旧sessionId。
+        s_clients[client_index].session_id = 0;
+        revoked = true;
+    }
+
+    portEXIT_CRITICAL(&s_clients_lock);
+
+    // MAC对应的客户端当前没有连接SoftAP
+    if (client_index < 0)
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    // 客户端存在，但不是指定的已认证会话。
+    // 可能是sessionId不匹配、尚未认证，或者已经被BLOCKED。
+    if (!revoked)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "Client authorization revoked, mac=%s, sessionId=%lld", mac_text, (long long)session_id);
+
+    return ESP_OK;
+}
+
+
 // 注册事件处理器，并接管后续客户端状态变化
 esp_err_t client_access_start(void)
 {
@@ -468,7 +706,7 @@ esp_err_t client_access_start(void)
 
     if (err != ESP_OK)
     {
-        esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, s_connected_handler);
+        esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, s_connected_handler);
         return err;
     }
 
@@ -483,38 +721,33 @@ esp_err_t client_access_start(void)
     
         return err;
     }
-    
 
-    // 补录启动状态管理之前已经连接到 SoftAP 的客户端
-    wifi_sta_list_t station_list = {0};
+    // 事件处理器注册完成后，补录此前已经连接并取得IP的客户端。
+    err = track_existing_softap_clients();
 
-    err = esp_wifi_ap_get_sta_list(&station_list);
     if (err != ESP_OK)
     {
-        esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, s_connected_handler);
-        esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, s_disconnected_handler);
-        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_ASSIGNED_IP_TO_CLIENT, s_ip_assigned_handler);
-        
+        esp_event_handler_instance_unregister(
+            WIFI_EVENT,
+            WIFI_EVENT_AP_STACONNECTED,
+            s_connected_handler);
+
+        esp_event_handler_instance_unregister(
+            WIFI_EVENT,
+            WIFI_EVENT_AP_STADISCONNECTED,
+            s_disconnected_handler);
+
+        esp_event_handler_instance_unregister(
+            IP_EVENT,
+            IP_EVENT_ASSIGNED_IP_TO_CLIENT,
+            s_ip_assigned_handler);
+
         return err;
-    }
-
-    for (int i = 0; i < station_list.num; i++)
-    {
-        err = track_connected_client(station_list.sta[i].mac);
-        if (err != ESP_OK)
-        {
-            // 启动失败时撤销已经注册的全部事件，避免下次启动重复注册
-            esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, s_connected_handler);
-            esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, s_disconnected_handler);
-            esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_ASSIGNED_IP_TO_CLIENT, s_ip_assigned_handler);    
-
-            return err;
-        }
     }
 
     s_started = true;
 
-    ESP_LOGI(TAG, "Client access started, initial clients=%d", station_list.num);
+    ESP_LOGI(TAG, "Client access started");
 
     return ESP_OK;
 }

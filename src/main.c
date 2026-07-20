@@ -336,6 +336,28 @@ static void handle_mqtt_command(const char *topic, int topic_len, const char *pa
 
         break;
     }
+    case APP_COMMAND_TYPE_REVOKE_ACCESS:
+    {
+        // app_command已经解析出MAC和sessionId。
+        // client_access负责核对并撤销对应的真实认证会话。
+        esp_err_t revoke_err = client_access_revoke_authorization(request.mac, request.session_id);
+
+        if (revoke_err == ESP_OK)
+        {
+            result.success = true;
+
+            // 这里只撤销外网访问权限，不断开客户端与SoftAP的连接。
+            snprintf(result.message, sizeof(result.message), "%s", "client authorization revoked");
+        }
+        else
+        {
+            result.success = false;
+
+            snprintf(result.message, sizeof(result.message), "revoke client authorization failed: %s", esp_err_to_name(revoke_err));
+        }
+
+        break;
+    }
 
     case APP_COMMAND_TYPE_KICK:
     case APP_COMMAND_TYPE_BLOCK_TRAFFIC:
