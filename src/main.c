@@ -6,6 +6,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_system.h"
 
 #include "app_storage.h"
 #include "wifi_gateway.h"
@@ -66,6 +67,28 @@ app_mqtt_config_t mqtt_config = {
     .command_handler = handle_mqtt_command,
 };
 
+// 选择正常网关模式使用的开放热点。
+static void select_normal_gateway_mode(void)
+{
+    wifi_config.ap_ssid = AP_SSID;
+    wifi_config.ap_password = AP_PASSWORD;
+
+    portal_config.provisioning_mode = false;
+}
+
+// 选择管理员本地配网模式。
+static void select_provisioning_mode(void)
+{
+    wifi_config.sta_enabled = false;
+    wifi_config.sta_ssid = NULL;
+    wifi_config.sta_password = NULL;
+
+    wifi_config.ap_ssid = PROVISION_AP_SSID;
+    wifi_config.ap_password = PROVISION_AP_PASSWORD;
+
+    portal_config.provisioning_mode = true;
+}
+
 static esp_err_t handle_wifi_provisioning(const char *ssid, const char *password)
 {
     if (ssid == NULL || password == NULL)
@@ -100,12 +123,12 @@ static esp_err_t prepare_wifi_gateway_config(void)
 
     if (err == ESP_OK)
     {
-        // NVS中存在有效凭据，启动正常网关模式
+        // 找到有效凭据，选择正常开放热点和APSTA网关模式
+        select_normal_gateway_mode();
+
         wifi_config.sta_enabled = true;
         wifi_config.sta_ssid = s_wifi_credentials.ssid;
         wifi_config.sta_password = s_wifi_credentials.password;
-
-        portal_config.provisioning_mode = false;
 
         ESP_LOGI(TAG, "Stored upstream WiFi found, normal gateway mode selected");
 
@@ -114,13 +137,8 @@ static esp_err_t prepare_wifi_gateway_config(void)
 
     if (err == ESP_ERR_NOT_FOUND)
     {
-        // 没有凭据不是程序故障，而是设备尚未完成首次配网
-        wifi_config.sta_enabled = false;
-        wifi_config.sta_ssid = NULL;
-        wifi_config.sta_password = NULL;
-
-        portal_config.provisioning_mode = true;
-
+        // 没有上游凭据，启动受保护的管理员配网热点。
+        select_provisioning_mode();
         ESP_LOGI(TAG, "No stored upstream WiFi, provisioning mode selected");
 
         return ESP_OK;
@@ -137,18 +155,33 @@ static esp_err_t prepare_wifi_gateway_config(void)
         {
             return err;
         }
-
-        wifi_config.sta_enabled = false;
-        wifi_config.sta_ssid = NULL;
-        wifi_config.sta_password = NULL;
-
-        portal_config.provisioning_mode = true;
+        select_provisioning_mode();
 
         return ESP_OK;
     }
 
     // Flash读取失败等真正的存储异常不能伪装成“尚未配网”。
     return err;
+}
+
+// 执行上游WiFi凭据失效后的恢复调度。
+static void handle_upstream_wifi_recovery(void)
+{
+    ESP_LOGW(TAG, "Upstream WiFi credentials appear invalid, clearing stored credentials");
+    // 删除已经连续认证失败的上游WIFI凭据
+    esp_err_t err = app_storage_clear_wifi_credentials();
+
+    if (err != ESP_OK)
+    {
+        // 清除失败时不能重启，否则设备重启仍会读取同一份失效凭据，形成重启循环
+        ESP_LOGE(TAG, "Clear upstream WiFi credentials failed: %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGW(TAG, "Upstream WiFi credentials cleared, restarting into provisioning mode");
+    // 给串口日志一点发送时间。
+    vTaskDelay(pdMS_TO_TICKS(500));
+    // 重启不会返回。
+    esp_restart();
 }
 
 static esp_err_t publish_device_status(void)
@@ -350,9 +383,19 @@ void app_main(void)
 
     while (true)
     {
+        wifi_gateway_status_t wifi_status = wifi_gateway_get_status();
+        if (wifi_status == WIFI_GATEWAY_STATUS_STA_RECOVERY_REQUIRED)
+        {
+            handle_upstream_wifi_recovery();
+
+            // 只有清除NVS失败时函数才会返回。
+            // 此时避免继续执行MQTT和状态发布。
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
         
         // 如果mqtt没启动并且sta获取到了ip，才启动mqtt
-        if (!mqtt_started && wifi_gateway_get_status() == WIFI_GATEWAY_STATUS_STA_GOT_IP)
+        if (!mqtt_started && wifi_status == WIFI_GATEWAY_STATUS_STA_GOT_IP)
         {
             esp_err_t mqtt_err = app_mqtt_start(&mqtt_config);
             if (mqtt_err == ESP_OK)
@@ -365,7 +408,7 @@ void app_main(void)
             }
         }
 
-       if (mqtt_started)
+       if (mqtt_started && wifi_status == WIFI_GATEWAY_STATUS_STA_GOT_IP)
        {
             esp_err_t publish_err = publish_device_status();
             if (publish_err != ESP_OK)
