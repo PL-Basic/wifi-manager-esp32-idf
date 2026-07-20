@@ -1,8 +1,5 @@
 #pragma once
 
-#define WIFI_SSID "your_upstream_wifi_ssid"
-#define WIFI_PASSWORD "your_upstream_wifi_password"
-
 #define AP_SSID "WifiManager-ESP32"
 #define AP_PASSWORD ""
 

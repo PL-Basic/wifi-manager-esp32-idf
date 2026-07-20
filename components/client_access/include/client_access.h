@@ -21,6 +21,20 @@ typedef enum
     CLIENT_ACCESS_STATE_BLOCKED
 } client_access_state_t;
 
+// 提供给其他模块读取的客户端信息快照。
+// 外部模块只能拿到复制后的数据，不能直接修改内部客户端状态表。
+typedef struct
+{
+    // 客户端的六字节MAC地址
+    uint8_t mac[6];
+
+    // DHCP分配给客户端的IPv4地址
+    uint32_t ipv4;
+
+    // 客户端当前的认证状态
+    client_access_state_t state;
+} client_access_snapshot_t;
+
 // 启动客户端状态管理，并监听SoftAP客户端事件
 esp_err_t client_access_start(void);
 
@@ -29,6 +43,9 @@ esp_err_t client_access_set_state(const uint8_t mac[6], client_access_state_t st
 
 // 查询指定在线客户端的访问状态
 esp_err_t client_access_get_state(const uint8_t mac[6], client_access_state_t *state);
+
+// 根据客户端IPv4地址读取一份状态快照
+esp_err_t client_access_get_snapshot_by_ipv4(uint32_t source_ip, client_access_snapshot_t *snapshot);
 
 // 这里使用 uint32_t，是因为 IPv4 地址底层就是一个 32 位值。这样公共头文件不需要暴露 lwIP 的内部类型。
 // 根据数据包的源IPv4地址判断对应客户端是否已经获得外网转发权限,只有在线并且状态为AUTHORIZED的客户端才返回true
