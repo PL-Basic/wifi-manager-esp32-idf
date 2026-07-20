@@ -1,10 +1,11 @@
 #include <stdio.h>
-#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -54,6 +55,12 @@ static int s_dns_socket = -1;
 // 保存SoftAP本机IPv4地址
 // 未认证客户端查询任何A记录时，都返回这个地址
 static uint32_t s_portal_ipv4 = 0;
+// DNS域名最长允许保存255个字符和一个结束符
+static char s_external_portal_domain[256] = {0};
+// 已转换为网络字节序的外部Portal服务器IPv4
+static uint32_t s_external_portal_ipv4 = 0;
+// false表示当前未启用外部Portal域名例外
+static bool s_external_portal_enabled = false;
 // DHCP选项114需要长期保存Portal地址
 static char s_portal_uri[32] = {0};
 
@@ -275,8 +282,19 @@ static int build_dns_response(const uint8_t *request, size_t request_length, boo
     {
         if (!client_authorized)
         {
-            // 未认证客户端：所有IPv4域名都指向Portal
-            answer_ipv4 = s_portal_ipv4;
+            // Portal域名必须指向外部服务器，不能继续指向ESP32本机
+            if (s_external_portal_enabled && strcasecmp(domain_name, s_external_portal_domain) == 0)
+            {
+                answer_ipv4 = s_external_portal_ipv4;
+
+                ESP_LOGI(TAG, "External Portal DNS matched, domain=%s", domain_name);
+            }
+            else
+            {
+                // 其他未认证域名继续指向ESP32本地Portal
+                answer_ipv4 = s_portal_ipv4;
+            }
+
             has_ipv4_answer = true;
         }
         else
@@ -496,10 +514,57 @@ static esp_err_t configure_softap_dhcp(esp_netif_t *ap_netif, const esp_netif_ip
     return ESP_OK;
 }
 
-
-
-esp_err_t portal_dns_start(void)
+static esp_err_t configure_external_portal(const char *external_portal_domain, const char *external_portal_ipv4)
 {
+    // 两个参数都为NULL，表示当前不启用外部Portal域名例外
+    if (external_portal_domain == NULL && external_portal_ipv4 == NULL)
+    {
+        s_external_portal_enabled = false;
+        s_external_portal_domain[0] = '\0';
+        s_external_portal_ipv4 = 0;
+
+        return ESP_OK;
+    }
+
+    // 域名和IPv4必须同时配置，不能只提供其中一个
+    if (external_portal_domain == NULL || external_portal_ipv4 == NULL || external_portal_domain[0] == '\0' || external_portal_ipv4[0] == '\0')
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int written = snprintf(s_external_portal_domain, sizeof(s_external_portal_domain), "%s", external_portal_domain);
+    if (written < 0 || (size_t)written >= sizeof(s_external_portal_domain))
+    {
+        return ESP_ERR_NO_MEM;
+    }
+    
+    ip4_addr_t parsed_ipv4 = {0};
+
+    // 将IPv4文本转换为DNS响应需要的底层地址
+    if (ip4addr_aton(external_portal_ipv4, &parsed_ipv4) == 0)
+    {
+        s_external_portal_domain[0] = '\0';
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_external_portal_ipv4 = parsed_ipv4.addr;
+    s_external_portal_enabled = true;
+
+    ESP_LOGI(TAG, "External Portal DNS configured, domain=%s, ip=%s", s_external_portal_domain, external_portal_ipv4);
+
+    return ESP_OK;
+}
+
+
+esp_err_t portal_dns_start(const char *external_portal_domain, const char *external_portal_ipv4)
+{
+    esp_err_t err = configure_external_portal(external_portal_domain, external_portal_ipv4);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    
+
     if (s_dns_task != NULL || s_dns_socket >= 0)
     {
         return ESP_OK;
@@ -515,7 +580,7 @@ esp_err_t portal_dns_start(void)
 
     esp_netif_ip_info_t ap_ip_info = {0};
 
-    esp_err_t err = esp_netif_get_ip_info(ap_netif, &ap_ip_info);
+    err = esp_netif_get_ip_info(ap_netif, &ap_ip_info);
 
     if (err != ESP_OK)
     {

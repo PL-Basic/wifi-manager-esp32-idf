@@ -1,4 +1,6 @@
 #include <stdint.h>
+#include <stdbool.h>
+
 #include "access_filter.h"
 #include "client_access.h"
 
@@ -16,12 +18,45 @@ static const char *TAG = "access_filter";
 // 保存默认SoftAP对应的lwIP底层网络接口
 // 过滤器只处理从这个接口进入的数据包
 static struct netif *s_softap_netif = NULL;
+// 保存已经转换为网络字节序的外部Portal服务器IPv4地址
+static ip4_addr_t s_portal_server_ipv4 = {0};
+// false表示当前尚未配置外部Portal服务器白名单
+static bool s_portal_server_enabled = false;
 
-esp_err_t access_filter_start(void)
+esp_err_t access_filter_start(const access_filter_config_t *config)
 {
+    if (config == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+
     if (s_softap_netif != NULL)
     {
         return ESP_OK;
+    }
+
+    if (config->portal_server_ipv4 == NULL)
+    {
+        s_portal_server_enabled = false;
+        s_portal_server_ipv4.addr = 0;
+    }
+    else
+    {
+        // 非NULL但内容为空，属于配置错误
+        if (config->portal_server_ipv4[0] == '\0')
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        // 将"192.168.137.1"这样的文本转换为底层IPv4值。
+        // 只在启动时转换一次，不能让每一个数据包都重新解析字符串。
+        if (ip4addr_aton(config->portal_server_ipv4,&s_portal_server_ipv4) == 0)
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        s_portal_server_enabled = true;
     }
     
     // 根据默认SoftAP
@@ -83,7 +118,7 @@ int access_filter_lwip_ip4_input(struct pbuf *packet, struct netif *input_netif)
         return 0;
     }
 
-    // 刚播流量需要保留，例如DHCP初次获取地址使用广播
+    // 广播流量需要保留，例如DHCP初次获取地址使用广播
     if (ip4_addr_isbroadcast(&destination_ip, input_netif))
     {
         return 0;
@@ -95,6 +130,11 @@ int access_filter_lwip_ip4_input(struct pbuf *packet, struct netif *input_netif)
         return 0;
     }
 
+    if (s_portal_server_enabled && ip4_addr_cmp(&destination_ip, &s_portal_server_ipv4))
+    {
+        return 0;
+    }
+    
     // 只有明确处于AUTHORIZED状态的源IP才能继续进入NAPT
     if (client_access_can_forward_ipv4(source_ip))
     {

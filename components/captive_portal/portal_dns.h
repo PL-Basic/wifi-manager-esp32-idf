@@ -2,6 +2,6 @@
 
 #include "esp_err.h"
 
-// 启动Captive Portal内部使用的DNS服务
-// 该函数只在captive_portal组件内部调用，因此头文件不放入公共include
-esp_err_t portal_dns_start(void);
+// 启动Portal DNS服务。
+// 两个参数同时为NULL表示不启用外部Portal域名例外。
+esp_err_t portal_dns_start(const char *external_portal_domain, const char *external_portal_ipv4);

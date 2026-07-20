@@ -1,14 +1,19 @@
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include "client_access.h"
 #include "captive_portal.h"
 #include "portal_dns.h"
 
 #include "esp_system.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // 浏览器application/x-www-form-urlencoded请求体的最大容量。
 #define PROVISION_BODY_SIZE 384
@@ -119,6 +124,125 @@ static int hex_character_to_value(char character)
     return -1;
 }
 
+// 获取当前HTTP请求对应客户端的IPv4地址
+// 该函数只能在HTTP URI处理函数中调用，因为只有那里request和socket才有效
+static esp_err_t get_request_source_ipv4(httpd_req_t *request, uint32_t *source_ip)
+{
+    if (request == NULL || source_ip == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 从HTTP请求中获取底层TCP socket描述符
+    int socket_fd = httpd_req_to_sockfd(request);
+    if (socket_fd < 0)
+    {
+        return ESP_FAIL;
+    }
+    // sockaddr_storage足够容纳IPv4和IPv6地址
+    struct sockaddr_storage peer_address = {0};
+    socklen_t peer_address_length = sizeof(peer_address);
+    
+    // 获取发起当前HTTP请求的客户端地址
+    if (getpeername(socket_fd,(struct sockaddr *)&peer_address, &peer_address_length) < 0)
+    {
+        ESP_LOGE(TAG, "Get HTTP peer address failed errno=%d", errno);
+        return ESP_FAIL;
+    }
+    
+    // 当前固件只处理IPv4客户端
+    if (peer_address.ss_family == AF_INET)
+    {
+        const struct sockaddr_in *peer_ipv4 = (const struct sockaddr_in *)&peer_address;
+        // 与client_access中的ip.addr使用相同的IPv4表示
+        *source_ip = peer_ipv4->sin_addr.s_addr;
+
+        return ESP_OK;
+    }
+
+    // IPv4客户端可能通过IPv6 socket表现为IPv4-mapped IPv6
+    if (peer_address.ss_family == AF_INET6)
+    {
+        const struct sockaddr_in6 *peer_ipv6 = (const struct sockaddr_in6 *)&peer_address;
+
+        // 只有::ffff:a.b.c.d这种形式才能转换为IPv4
+        if (!IN6_IS_ADDR_V4MAPPED(&peer_ipv6->sin6_addr))
+        {
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+
+        // IPv4-mapped IPv6的最后4个字节就是原始IPv4地址
+        memcpy(source_ip, &peer_ipv6->sin6_addr.s6_addr[12], sizeof(*source_ip));
+
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "Unsupported HTTP peer address family: %d", peer_address.ss_family);
+
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+// 将已识别出的客户端信息拼接到外部Portal地址，并返回302重定向
+static esp_err_t send_external_portal_redirect(httpd_req_t *request, const client_access_snapshot_t *snapshot)
+{
+    if (request == NULL || snapshot == NULL || s_config.external_portal_url == NULL || s_config.device_code == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // MAC文本需要17个可见字符和一个字符串结束符
+    char mac_text[18] = {0};
+
+    int mac_written = snprintf(
+        mac_text,
+        sizeof(mac_text),
+        "%02X:%02X:%02X:%02X:%02X:%02X",
+        snapshot->mac[0],
+        snapshot->mac[1],
+        snapshot->mac[2],
+        snapshot->mac[3],
+        snapshot->mac[4],
+        snapshot->mac[5]
+    );
+
+    if (mac_written < 0 || (size_t)mac_written >= sizeof(mac_text))
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_ip4_addr_t client_ip = {
+        .addr = snapshot->ipv4
+    };
+
+    // 当前约定：external_portal_url本身不能带查询参数
+    char redirect_url[320] = {0};
+
+    int written = snprintf(
+        redirect_url,
+        sizeof(redirect_url),
+        "%s?deviceCode=%s&mac=%s&ip=" IPSTR,
+        s_config.external_portal_url,
+        s_config.device_code,
+        mac_text,
+        IP2STR(&client_ip)
+    );
+
+    if (written < 0 || (size_t)written >= sizeof(redirect_url))
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "External Portal redirect: %s", redirect_url);
+
+    // 302告诉浏览器跳转到外部Portal
+    httpd_resp_set_status(request, "302 Found");
+    httpd_resp_set_hdr(request, "Location", redirect_url);
+    httpd_resp_set_hdr(request, "Cache-Control", "no-store");
+    httpd_resp_set_type(request, "text/plain; charset=utf-8");
+    
+    return httpd_resp_send(request, "Redirecting to external portal", HTTPD_RESP_USE_STRLEN);
+}
+
 // 解码application/x-www-form-urlencoded中的字段值。
 static esp_err_t decode_form_value(const char *encoded, char *decoded, size_t decoded_size)
 {
@@ -182,6 +306,53 @@ static esp_err_t decode_form_value(const char *encoded, char *decoded, size_t de
 
 static esp_err_t portal_page_handler(httpd_req_t *request)
 {
+
+    client_access_snapshot_t snapshot = {0};
+    bool snapshot_found = false;
+
+    // 配网模式只显示本地配网页面，不查询客户端认证状态
+    if (!s_config.provisioning_mode)
+    {
+        uint32_t source_ip = 0;
+
+        esp_err_t err = get_request_source_ipv4(request, &source_ip);
+        if (err == ESP_OK)
+        {
+            err = client_access_get_snapshot_by_ipv4(source_ip, &snapshot);
+            if (err == ESP_OK)
+            {
+                snapshot_found = true;
+
+                esp_ip4_addr_t source_address = {
+                    .addr = source_ip
+                };
+
+                ESP_LOGI(TAG, "Portal request: ip=" IPSTR ", state=%s", IP2STR(&source_address), client_access_state_to_string(snapshot.state));
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Portal client snapshot not found: %s", esp_err_to_name(err));
+            }
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Get Portal request source IP failed: %s", esp_err_to_name(err));
+        }
+    } 
+
+    if (!s_config.provisioning_mode && s_config.external_portal_url != NULL && snapshot_found)
+    {
+        esp_err_t redirect_err = send_external_portal_redirect(request, &snapshot);
+
+        if (redirect_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Send external Portal redirect failed: %s", esp_err_to_name(redirect_err));
+            return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Portal redirect failed");
+        }
+        return ESP_OK;
+    }
+
+    // 前端尚未完成或当前是配网模式时，继续显示内置页面
     httpd_resp_set_type(request, "text/html; charset=utf-8");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
 
@@ -351,6 +522,46 @@ static esp_err_t register_provision_uri(httpd_handle_t server)
     return httpd_register_uri_handler(server, &handler);
 }
 
+// 校验外部Portal的配置是否完整
+// 三项全部未NULL表示关闭外部Portal：只配置一部分属于错误
+static esp_err_t validate_external_portal_config(const captive_portal_config_t *config)
+{
+    if (config == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    // URL、域名和服务器IP全部未NULL，表示主动关闭外部Portal
+    bool external_portal_disabled = config->external_portal_url == NULL && config->external_portal_domain == NULL && config->external_portal_ipv4 == NULL;
+
+    if (external_portal_disabled)
+    {
+        return ESP_OK;
+    }
+    
+    // 启动外部Portal时，四项配置缺一不可
+    if (config->external_portal_url == NULL || config->external_portal_domain == NULL || config->external_portal_ipv4 == NULL || config->device_code == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // NULL表示关闭功能，而空字符串属于错误配置
+    if (config->external_portal_url[0] == '\0' || config->external_portal_domain[0] == '\0' || config->external_portal_ipv4[0] == '\0' || config->device_code[0] == '\0')
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // 当前重定向代码会自行添加查询参数，
+    // 因此外部Portal基础地址不能已经携带问号。
+    if (strchr(config->external_portal_url, '?') != NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return ESP_OK;
+}
+
+
 esp_err_t captive_portal_start(const captive_portal_config_t *config)
 {
     if (config == NULL)
@@ -362,6 +573,19 @@ esp_err_t captive_portal_start(const captive_portal_config_t *config)
     if (config->provisioning_mode && config->provision_handler == NULL)
     {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    // 普通网关模式才会使用外部Portal配置。
+    // 本地配网模式不依赖外部服务器。
+    if (!config->provisioning_mode)
+    {
+        esp_err_t config_err = validate_external_portal_config(config);
+
+        if (config_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Invalid external Portal configuration");
+            return config_err;
+        }
     }
 
     if (s_server != NULL)
@@ -438,10 +662,16 @@ esp_err_t captive_portal_start(const captive_portal_config_t *config)
 
         return err;
     }
-    
 
-    // HTTP路由完整后，再启动DNS服务
-    err = portal_dns_start();
+    // 本地配网模式没有STA上游，不需要配置外部Portal域名例外
+    if (s_config.provisioning_mode)
+    {
+        err = portal_dns_start(NULL, NULL);
+    }
+    else
+    {
+        err = portal_dns_start(s_config.external_portal_domain, s_config.external_portal_ipv4);
+    }
 
     if (err != ESP_OK)
     {
