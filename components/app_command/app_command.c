@@ -270,53 +270,120 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
         // 先保存从topic 识别出的命令类型
         // 即使后续payload 解析失败，调用方仍然知道是哪种命令失败
         request->type = topic_command_type;
-        
-        // allow 要求放行指定MAC对应的客户端会话
-        if (topic_command_type == APP_COMMAND_TYPE_ALLOW || topic_command_type == APP_COMMAND_TYPE_REVOKE_ACCESS)
+
+        if (topic_command_type == APP_COMMAND_TYPE_ALLOW)
         {
-            err = read_json_string_field(payload_buffer,"mac",request->mac,sizeof(request->mac));
-            
+            // ALLOW 必须包含目标客户端 MAC
+            err = read_json_string_field(payload_buffer, "mac", request->mac, sizeof(request->mac));
             if (err != ESP_OK)
             {
-                ESP_LOGE(TAG, "Read %s mac failed: %s", app_command_type_to_string(topic_command_type), esp_err_to_name(err));
+                ESP_LOGE(TAG, "Read ALLOW mac failed: %s", esp_err_to_name(err));
                 return err;
             }
 
-            err = read_json_int64_field(payload_buffer,"sessionId",&request->session_id);
-
+            // ALLOW 必须包含后端创建的 sessionId
+            err = read_json_int64_field(payload_buffer, "sessionId", &request->session_id);
             if (err != ESP_OK)
             {
-                ESP_LOGE(TAG, "Read %s sessionId failed: %s", app_command_type_to_string(topic_command_type), esp_err_to_name(err));
+                ESP_LOGE(TAG, "Read ALLOW sessionId failed: %s", esp_err_to_name(err));
                 return err;
             }
 
-            ESP_LOGI(TAG, "%s parsed, mac=%s, sessionId=%lld", app_command_type_to_string(topic_command_type), request->mac, (long long)request->session_id);
+            // ALLOW 必须包含本次授权的有效时长
+            // 固件使用相对时长，而不是直接依赖后端的绝对时间
+            err = read_json_int64_field(payload_buffer, "ttlSeconds", &request->ttl_seconds);
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Read ALLOW ttlSeconds failed: %s", esp_err_to_name(err));
 
-        } // disconnect-mac 命令必须从payload中读取mac和alertId
+                return err;
+            }
+
+            // 校验授权时长，避免 0 秒、负数或超大数值
+            if (request->ttl_seconds < APP_COMMAND_TTL_SECONDS_MIN || request->ttl_seconds > APP_COMMAND_TTL_SECONDS_MAX)
+            {
+                ESP_LOGE(TAG, "Invalid ALLOW ttlSeconds=%lld, expected range=%d..%d", (long long)request->ttl_seconds, APP_COMMAND_TTL_SECONDS_MIN, APP_COMMAND_TTL_SECONDS_MAX);
+
+                return ESP_ERR_INVALID_ARG;
+            }
+
+            ESP_LOGI(TAG, "ALLOW parsed, mac=%s, sessionId=%lld, ttlSeconds=%lld", request->mac, (long long)request->session_id, (long long)request->ttl_seconds);
+        }
+        else if (topic_command_type == APP_COMMAND_TYPE_REVOKE_ACCESS)
+        {
+            // REVOKE_ACCESS 不需要 ttlSeconds，只需要匹配
+            // 当前客户端和当前认证会话
+            err = read_json_string_field(payload_buffer, "mac", request->mac, sizeof(request->mac));
+
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Read REVOKE_ACCESS mac failed: %s", esp_err_to_name(err));
+
+                return err;
+            }
+
+            err = read_json_int64_field(payload_buffer, "sessionId", &request->session_id);
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Read REVOKE_ACCESS sessionId failed: %s", esp_err_to_name(err));
+
+                return err;
+            }
+
+            ESP_LOGI(TAG,"REVOKE_ACCESS parsed, mac=%s, sessionId=%lld", request->mac, (long long)request->session_id);
+        }
         else if (topic_command_type == APP_COMMAND_TYPE_DISCONNECT_MAC)
         {
-            // 读取要断开的客户端MAC地址
-            err = read_json_string_field(payload_buffer,"mac",request->mac,sizeof(request->mac));
-
+            // 后端 payload 格式：{"mac":"AA:BB:CC:DD:EE:FF","alertId":123}
+            // mac 是必填字段，标识要断开哪个客户端
+            err = read_json_string_field(payload_buffer, "mac", request->mac, sizeof(request->mac));
             if (err != ESP_OK)
             {
-                ESP_LOGE(TAG, "Read disconnect-mac mac failed: %s", esp_err_to_name(err));
-            
+                ESP_LOGE(TAG, "Read DISCONNECT_MAC mac failed: %s", esp_err_to_name(err));
+                return err;
+            }
+            // alertId 是必填字段，关联后端告警记录
+            err = read_json_int64_field(payload_buffer, "alertId", &request->alert_id);
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Read DISCONNECT_MAC alertId failed: %s", esp_err_to_name(err));
                 return err;
             }
 
-            // 读取触发本次端口操作的告警编号
-            err = read_json_int64_field(payload_buffer,"alertId",&request->alert_id);
-
-            if (err != ESP_OK)
-            {
-                ESP_LOGE(TAG,"Read disconnect-mac alertId failed: %s", esp_err_to_name(err));
-                
-                return err;
-            }
-
-            // 当前只证明参数解析成功，还没有真正断开客户端
             ESP_LOGI(TAG, "DISCONNECT_MAC parsed, mac=%s, alertId=%lld", request->mac, (long long)request->alert_id);
+        }
+        else if (topic_command_type == APP_COMMAND_TYPE_KICK)
+        {
+            // 后端 payload 格式：{"deviceCode":"...","reason":"..."}
+            // reason 字段可选，缺失时不报错，仅记录为空
+            err = read_json_string_field(payload_buffer, "reason", request->mac, sizeof(request->mac));
+            if (err != ESP_OK && err != ESP_ERR_NOT_FOUND)
+            {
+                ESP_LOGE(TAG, "Read KICK reason failed: %s", esp_err_to_name(err));
+                return err;
+            }
+
+            ESP_LOGI(TAG, "KICK parsed, reason=%s", request->mac);
+        }
+        else if (topic_command_type == APP_COMMAND_TYPE_BLOCK_TRAFFIC)
+        {
+            // 后端 payload 格式：{"dstIp":"1.2.3.4","sni":"example.com","alertId":123}
+            // alertId 必填，关联告警规则
+            err = read_json_int64_field(payload_buffer, "alertId", &request->alert_id);
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Read BLOCK_TRAFFIC alertId failed: %s", esp_err_to_name(err));
+                return err;
+            }
+            // dstIp 必填，标识要阻断的目标IP
+            err = read_json_string_field(payload_buffer, "dstIp", request->mac, sizeof(request->mac));
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Read BLOCK_TRAFFIC dstIp failed: %s", esp_err_to_name(err));
+                return err;
+            }
+
+            ESP_LOGI(TAG, "BLOCK_TRAFFIC parsed, alertId=%lld, dstIp=%s", (long long)request->alert_id, request->mac);
         }
 
         ESP_LOGI(TAG,"Formal command recognized:%s",app_command_type_to_string(topic_command_type));

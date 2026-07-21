@@ -30,6 +30,11 @@ static const char *TAG = "captive_portal";
 static httpd_handle_t s_server = NULL;
 static captive_portal_config_t s_config = {0};
 
+void captive_portal_set_provisioning_mode(bool provisioning)
+{
+    s_config.provisioning_mode = provisioning;
+}
+
 // 未配置上游网络时显示的最小本地页面。
 // 该页面必须保存在ESP32中，因为此时设备还不能访问外部服务器。
 static const char s_provisioning_html[] =

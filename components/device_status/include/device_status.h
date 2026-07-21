@@ -6,6 +6,7 @@
 typedef struct 
 {
     const char *device_code;
+    int status;
     const char *wifi_status;
     const char *ip;
     int current_clients;

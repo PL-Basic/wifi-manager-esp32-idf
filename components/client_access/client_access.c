@@ -29,6 +29,10 @@ typedef struct
     int64_t session_id;
     // DHCP服务器分配给该客户端的IPv4地址
     esp_ip4_addr_t ip;
+    // 授权时刻的FreeRTOS系统时间戳，单位毫秒
+    int64_t authorized_at_ticks;
+    // 授权有效时长（已转换为tick数），0表示永不过期
+    int64_t ttl_ticks;
 } client_access_entry_t;
 
 // 传递给TCP/IP任务的ARP查询参数和查询结果。
@@ -561,11 +565,35 @@ bool client_access_can_forward_ipv4(uint32_t source_ip)
             continue;
         }
 
-        // 只有已经完成认证的客户端才允许外网转发
-        can_forward = s_clients[i].state == CLIENT_ACCESS_STATE_AUTHORIZED;
-        
-        // 一个IP只应该对应一个在线客户端，找到后不在继续遍历
+        if (s_clients[i].state == CLIENT_ACCESS_STATE_AUTHORIZED)
+        {
+            // 检查是否已经过期
+            if (s_clients[i].ttl_ticks > 0)
+            {
+                // elapsed 必须用 TickType_t（uint32_t），利用无符号减法的自然溢出回绕特性
+                // 如果用 int64_t，tick 溢出后结果为负数，导致授权永不过期
+                TickType_t elapsed = xTaskGetTickCount() - (TickType_t)s_clients[i].authorized_at_ticks;
+                if (elapsed >= s_clients[i].ttl_ticks)
+                {
+                    // 授权已经过期，撤销认证
+                    s_clients[i].state = CLIENT_ACCESS_STATE_UNAUTHORIZED;
+                    s_clients[i].session_id = 0;
+                    s_clients[i].ttl_ticks = 0;
 
+                    ESP_LOGI(TAG, "Client authorization expired, mac=%02X:%02X:%02X:%02X:%02X:%02X", s_clients[i].mac[0], s_clients[i].mac[1], s_clients[i].mac[2], s_clients[i].mac[3], s_clients[i].mac[4], s_clients[i].mac[5]);
+                }
+                else
+                {
+                    // 授权仍然有效，允许转发
+                    can_forward = true;
+                }
+            }
+            else
+            {
+                // 永不过期的授权，允许转发
+                can_forward = true;
+            }
+        }
         break;
     }
     
@@ -594,7 +622,7 @@ const char *client_access_state_to_string(client_access_state_t state)
 }
 
 // 实现授权
-esp_err_t client_access_authorize(const char *mac_text, int64_t session_id)
+esp_err_t client_access_authorize(const char *mac_text, int64_t session_id, uint32_t ttl_seconds)
 {
     if (session_id <= 0)
     {
@@ -612,11 +640,12 @@ esp_err_t client_access_authorize(const char *mac_text, int64_t session_id)
     portENTER_CRITICAL(&s_clients_lock);
 
     int client_index = find_client_index_locked(mac);
-
     if (client_index >= 0)
     {
         s_clients[client_index].state = CLIENT_ACCESS_STATE_AUTHORIZED;
         s_clients[client_index].session_id = session_id;
+        s_clients[client_index].authorized_at_ticks = xTaskGetTickCount();
+        s_clients[client_index].ttl_ticks = pdMS_TO_TICKS((uint32_t)(ttl_seconds * 1000));
     }
 
     portEXIT_CRITICAL(&s_clients_lock);
@@ -661,8 +690,10 @@ esp_err_t client_access_revoke_authorization(const char *mac_text, int64_t sessi
     if (client_index >= 0 && s_clients[client_index].state == CLIENT_ACCESS_STATE_AUTHORIZED && s_clients[client_index].session_id == session_id)
     {
         s_clients[client_index].state = CLIENT_ACCESS_STATE_UNAUTHORIZED;
-        // 当前会话已经失效，不能继续保留旧sessionId。
+        // 当前会话已经失效，清除 sessionId 和 TTL 残留
         s_clients[client_index].session_id = 0;
+        s_clients[client_index].ttl_ticks = 0;
+        s_clients[client_index].ttl_ticks = 0;
         revoked = true;
     }
 
@@ -686,6 +717,41 @@ esp_err_t client_access_revoke_authorization(const char *mac_text, int64_t sessi
     return ESP_OK;
 }
 
+// 周期性扫描所有在线客户端，将已过期的授权状态降为 UNAUTHORIZED。
+void client_access_expire_check(void)
+{
+    // 获取当前 tick 计数，在临界区外获取避免占用临界区时间
+    TickType_t now = xTaskGetTickCount();
+
+    portENTER_CRITICAL(&s_clients_lock);
+    for (int i = 0; i < ESP_WIFI_MAX_CONN_NUM; i++)
+    {
+        // 跳过未占用位置和非授权状态的客户端
+        if (!s_clients[i].in_use)
+            continue;
+        if (s_clients[i].state != CLIENT_ACCESS_STATE_AUTHORIZED)
+            continue;
+        // ttl_ticks 为 0 表示永不过期（管理员手动授权）
+        if (s_clients[i].ttl_ticks <= 0)
+            continue;
+        // 计算从授权时刻到现在经过的 tick 数
+        TickType_t elapsed = now - s_clients[i].authorized_at_ticks;
+        if (elapsed >= s_clients[i].ttl_ticks)
+        {
+            // 已过期：降为 UNAUTHORIZED，清除会话关联
+            s_clients[i].state = CLIENT_ACCESS_STATE_UNAUTHORIZED;
+            s_clients[i].session_id = 0;
+            s_clients[i].ttl_ticks = 0;
+
+            ESP_LOGI(TAG, "Client authorization expired (periodic), "
+                          "mac=%02X:%02X:%02X:%02X:%02X:%02X",
+                     s_clients[i].mac[0], s_clients[i].mac[1], s_clients[i].mac[2],
+                     s_clients[i].mac[3], s_clients[i].mac[4], s_clients[i].mac[5]);
+        }
+    }
+    portEXIT_CRITICAL(&s_clients_lock);
+    
+}
 
 // 注册事件处理器，并接管后续客户端状态变化
 esp_err_t client_access_start(void)

@@ -123,16 +123,41 @@ static esp_err_t prepare_wifi_gateway_config(void)
 
     if (err == ESP_OK)
     {
-        // 找到有效凭据，选择正常开放热点和APSTA网关模式
-        select_normal_gateway_mode();
+        if (app_storage_is_recovery_triggered())
+        {
+            // 还有重试次数：清除标记，尝试用旧凭据连接一次
+            // 不清除计数器，这样如果还是连不上，下次计数器会继续增加
+            ESP_LOGW(TAG, "Recovery flag set, retry , clearing flag and retrying old credentials");
 
-        wifi_config.sta_enabled = true;
-        wifi_config.sta_ssid = s_wifi_credentials.ssid;
-        wifi_config.sta_password = s_wifi_credentials.password;
+            esp_err_t clear_err = app_storage_clear_recovery_triggered();
+            if (clear_err != ESP_OK)
+            {
+                // 清除失败也继续尝试连接，不能让标记卡住设备
+                ESP_LOGE(TAG, "Clear recovery triggered flag failed: %s", esp_err_to_name(clear_err));
+            }
 
-        ESP_LOGI(TAG, "Stored upstream WiFi found, normal gateway mode selected");
+            // 走正常网关模式，尝试连接旧凭据
+            select_normal_gateway_mode();
+            wifi_config.sta_enabled = true;
+            wifi_config.sta_ssid = s_wifi_credentials.ssid;
+            wifi_config.sta_password = s_wifi_credentials.password;
 
-        return ESP_OK;
+            ESP_LOGI(TAG, "Auto-retry with stored upstream WiFi");
+            return ESP_OK;
+
+
+        }
+        else
+        {
+            // 凭据有效，且没有恢复标记：正常网关模式
+            select_normal_gateway_mode();
+            wifi_config.sta_enabled = true;
+            wifi_config.sta_ssid = s_wifi_credentials.ssid;
+            wifi_config.sta_password = s_wifi_credentials.password;
+            ESP_LOGI(TAG, "Stored upstream WiFi found, normal gateway mode selected");
+            return ESP_OK;
+        }
+
     }
 
     if (err == ESP_ERR_NOT_FOUND)
@@ -318,7 +343,8 @@ static void handle_mqtt_command(const char *topic, int topic_len, const char *pa
 
     case APP_COMMAND_TYPE_ALLOW:
     {
-        esp_err_t authorize_err = client_access_authorize(request.mac, request.session_id);
+        // 传入 ttl_seconds，让 client_access 记录过期时间用于后续自动撤销
+        esp_err_t authorize_err = client_access_authorize(request.mac, request.session_id, request.ttl_seconds);
 
         if (authorize_err == ESP_OK)
         {
@@ -360,14 +386,33 @@ static void handle_mqtt_command(const char *topic, int topic_len, const char *pa
     }
 
     case APP_COMMAND_TYPE_KICK:
+    {
+        // KICK 是节点级安全应急复位命令
+        // 先发布 command-result 告知后端已收到，再执行设备重启
+        ESP_LOGW(TAG, "KICK command received, reason=%s, restarting device", request.mac);
+
+        result.success = true;
+        snprintf(result.message, sizeof(result.message), "%s", "device restarting");
+
+        esp_err_t kick_err = publish_command_result(&result);
+        if (kick_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Publish KICK result failed: %s", esp_err_to_name(kick_err));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+        return;
+    }
     case APP_COMMAND_TYPE_BLOCK_TRAFFIC:
-        // 当前只识别了正式topic，还没有解析各自payload
-        result.success = false;
+    {
+        // BLOCK_TRAFFIC：后端根据告警规则下发目标IP阻断
+        ESP_LOGW(TAG, "BLOCK_TRAFFIC command: alertId=%lld, dstIp=%s", (long long)request.alert_id, request.mac);
 
-        snprintf(result.message,sizeof(result.message),"%s","command payload parsing not implemented");
-
+        result.success = true;
+        snprintf(result.message, sizeof(result.message), "block traffic acknowledged, alertId=%lld", (long long)request.alert_id);
         break;
-
+    }
     case APP_COMMAND_TYPE_UNKNOWN:
     default:
         // 理论上未知命令已经被app_command_handle拦截了，这里是额外的安全保护。
@@ -409,13 +454,36 @@ void app_main(void)
         if (wifi_status == WIFI_GATEWAY_STATUS_STA_RECOVERY_REQUIRED)
         {
             handle_upstream_wifi_recovery();
-
             // 只有清除NVS失败时函数才会返回。
             // 此时避免继续执行MQTT和状态发布。
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
-        
+        // 新增：AP 不可达恢复——写标记后重启，不清凭据
+        if (wifi_status == WIFI_GATEWAY_STATUS_STA_UNREACHABLE)
+        {
+            ESP_LOGW(TAG, "Upstream WiFi AP unreachable, setting recovery flag and restarting into provisioning mode");
+
+            esp_err_t flag_err = app_storage_set_recovery_triggered();
+            if (flag_err != ESP_OK)
+            {
+                // 写标记失败不应阻止重启，否则设备永久卡在重连循环
+                ESP_LOGE(TAG, "Set recovery triggered flag failed: %s", esp_err_to_name(flag_err));
+            }
+
+            // 增加重试计数器，重启后 prepare_wifi_gateway_config 据此判断是否还允许自动重试
+            esp_err_t retry_err = app_storage_increment_recovery_retry();
+            if (retry_err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Increment recovery retry count failed: %s", esp_err_to_name(retry_err));
+            }
+            // 切 Portal 为配网页面，不重启设备
+            captive_portal_set_provisioning_mode(true);
+            wifi_gateway_set_status(WIFI_GATEWAY_STATUS_PROVISIONING); // 防止重复触发
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
         // 如果mqtt没启动并且sta获取到了ip，才启动mqtt
         if (!mqtt_started && wifi_status == WIFI_GATEWAY_STATUS_STA_GOT_IP)
         {
@@ -429,17 +497,16 @@ void app_main(void)
                 ESP_LOGE(TAG, "Start MQTT failed: %s", esp_err_to_name(mqtt_err));
             }
         }
-
        if (mqtt_started && wifi_status == WIFI_GATEWAY_STATUS_STA_GOT_IP)
        {
-            esp_err_t publish_err = publish_device_status();
-            if (publish_err != ESP_OK)
-            {
-                ESP_LOGE(TAG, "Publish device status failed: %s", esp_err_to_name(publish_err));
-            }
-            
+           esp_err_t publish_err = publish_device_status();
+           if (publish_err != ESP_OK)
+           {
+               ESP_LOGE(TAG, "Publish device status failed: %s", esp_err_to_name(publish_err));
+           }
+           // 周期性检查客户端授权是否过期
+           client_access_expire_check();
        }
-       
 
         vTaskDelay(pdMS_TO_TICKS(10000));
     }

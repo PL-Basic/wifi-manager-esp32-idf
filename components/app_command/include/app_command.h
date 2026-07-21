@@ -10,6 +10,10 @@
 #define APP_COMMAND_MESSAGE_SIZE 96
 // 标准 MAC 地址有 17 个可见字符，最后还需要一个 '\0'
 #define APP_COMMAND_MAC_SIZE 18
+// ALLOW 命令允许的最小授权时长，单位：秒
+#define APP_COMMAND_TTL_SECONDS_MIN 1
+// ALLOW 命令允许的最大授权时长，单位：秒
+#define APP_COMMAND_TTL_SECONDS_MAX 86400
 
 // app_command 将MQTT传来的字符串转换成这个枚举
 typedef enum
@@ -44,6 +48,8 @@ typedef struct
     int64_t alert_id;
     // 后端为本次认证创建的会话编号
     int64_t session_id;
+    // 本次授权有效时长，单位：秒
+    int64_t ttl_seconds;
 }app_command_request_t;
 
 typedef struct

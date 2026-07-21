@@ -11,6 +11,10 @@
 // namespace内部的两个字段名
 #define APP_STORAGE_WIFI_SSID_KEY "sta_ssid"
 #define APP_STORAGE_WIFI_PASSWORD_KEY "sta_password"
+// AP不可达恢复标记键名，uint8_t类型，1=恢复模式（凭据保留），0或无此键=正常
+#define APP_STORAGE_RECOVERY_TRIGGERED_KEY "recv_trig"
+// AP不可达自动重试计数器键名，uint8_t类型，每次STA_UNREACHABLE加一
+#define APP_STORAGE_RECOVERY_RETRY_KEY "recv_retry"
 
 static const char *TAG = "app_storage";
 
@@ -48,6 +52,66 @@ static esp_err_t validate_wifi_credentials(const app_storage_wifi_credentials_t 
     return ESP_OK;
 }
 
+esp_err_t app_storage_increment_recovery_retry(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    // 先读取当前值，再写入加一后的值
+    uint8_t count = 0;
+    esp_err_t read_err = nvs_get_u8(handle, APP_STORAGE_RECOVERY_RETRY_KEY, &count);
+    if (read_err != ESP_OK && read_err != ESP_ERR_NVS_NOT_FOUND)
+    {
+        nvs_close(handle);
+        return read_err;
+    }
+
+    // 防止整数回绕，到达 255 后不再增加
+    if (count < 255)
+    {
+        count++;
+    }
+
+    err = nvs_set_u8(handle, APP_STORAGE_RECOVERY_RETRY_KEY, count);
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Recovery retry count incremented to %u", (unsigned)count);
+    }
+    return err;
+}
+
+uint8_t app_storage_get_recovery_retry_count(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK)
+    {
+        return 0;
+    }
+
+    uint8_t count = 0;
+    err = nvs_get_u8(handle, APP_STORAGE_RECOVERY_RETRY_KEY, &count);
+    nvs_close(handle);
+
+    // 键不存在也返回 0，符合"从未触发过恢复"的语义
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND)
+    {
+        return 0;
+    }
+    return count;
+}
+
 esp_err_t app_storage_save_wifi_credentials(const app_storage_wifi_credentials_t *credentials)
 {
     esp_err_t err = validate_wifi_credentials(credentials);
@@ -76,11 +140,47 @@ esp_err_t app_storage_save_wifi_credentials(const app_storage_wifi_credentials_t
         err = nvs_set_str(handle, APP_STORAGE_WIFI_PASSWORD_KEY, credentials->password);
     }
 
-    // nvs_set_str修改的是待提交数据。
-    // nvs_commit成功才表示修改已经正式提交到Flash。
+    // 前一步成功后才保存密码和清除恢复标记，避免覆盖真正的错误码。
     if (err == ESP_OK)
     {
-        err = nvs_commit(handle);
+        err = nvs_commit(handle); // 提交凭据保存
+
+        // 凭据保存成功后，自动清除恢复标记（换网或重试都意味着问题已解决）
+        if (err == ESP_OK)
+        {
+            // 擦除 recovery triggered（忽略不存在）
+            esp_err_t erase_err = nvs_erase_key(handle, APP_STORAGE_RECOVERY_TRIGGERED_KEY);
+            if (erase_err == ESP_ERR_NVS_NOT_FOUND)
+            {
+                erase_err = ESP_OK;
+            }
+            // 擦除 retry counter（忽略不存在）
+            esp_err_t retry_err = nvs_erase_key(handle, APP_STORAGE_RECOVERY_RETRY_KEY);
+            if (retry_err == ESP_ERR_NVS_NOT_FOUND)
+            {
+                   retry_err = ESP_OK;
+            }
+            // 如果两个擦除都成功（或不存在），则统一提交；否则记录警告
+            if (erase_err == ESP_OK && retry_err == ESP_OK)
+            {
+                err = nvs_commit(handle); // 集中提交一次
+                if (err != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "Commit recovery clear failed: %s", esp_err_to_name(err));
+                }
+            }
+            else
+            {
+                if (erase_err != ESP_OK)
+                {
+                    ESP_LOGW(TAG, "Erase recovery triggered failed: %s", esp_err_to_name(erase_err));
+                }
+                if (retry_err != ESP_OK)
+                {
+                    ESP_LOGW(TAG, "Erase retry count failed: %s", esp_err_to_name(retry_err));
+                }
+            }
+        }
     }
 
     // 只要nvs_open成功，无论后面的操作成功还是失败，都必须关闭句柄
@@ -220,6 +320,73 @@ esp_err_t app_storage_clear_wifi_credentials(void)
     }
 
     return err; 
+}
+
+esp_err_t app_storage_set_recovery_triggered(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    uint8_t value = 1;
+    err = nvs_set_u8(handle, APP_STORAGE_RECOVERY_TRIGGERED_KEY, value);
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Recovery triggered flag set");
+    }
+    return err;
+}
+
+esp_err_t app_storage_clear_recovery_triggered(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        // 命名空间不存在也可以视为已经清除
+        if (err == ESP_ERR_NVS_NOT_FOUND)
+        {
+            return ESP_OK;
+        }
+        return err;
+    }
+
+    err = nvs_erase_key(handle, APP_STORAGE_RECOVERY_TRIGGERED_KEY);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        err = ESP_OK; // 键本来就不存在，不算错误
+    }
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+bool app_storage_is_recovery_triggered(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK)
+    {
+        return false;
+    }
+
+    uint8_t value = 0;
+    err = nvs_get_u8(handle, APP_STORAGE_RECOVERY_TRIGGERED_KEY, &value);
+    nvs_close(handle);
+
+    return (err == ESP_OK && value == 1);
 }
 
 esp_err_t app_storage_init_nvs(void)

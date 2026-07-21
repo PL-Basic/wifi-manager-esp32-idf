@@ -15,6 +15,7 @@ esp_err_t device_status_collect(device_status_snapshot_t *snapshot)
     wifi_gateway_status_t wifi_status = wifi_gateway_get_status();
 
     snapshot->device_code = DEVICE_CODE;
+    snapshot->status = (wifi_status == WIFI_GATEWAY_STATUS_STA_GOT_IP) ? 1 : 0; 
     snapshot->wifi_status = wifi_gateway_status_to_string(wifi_status);
     snapshot->ip = wifi_gateway_get_sta_ip();
     snapshot->current_clients = wifi_gateway_get_current_clients();
@@ -30,7 +31,7 @@ esp_err_t device_status_to_json(const device_status_snapshot_t *snapshot,char *b
         return ESP_ERR_INVALID_ARG;
     }
 
-    int written = snprintf(buffer, buffer_size, "{\"deviceCode\":\"%s\",\"wifiStatus\":\"%s\",\"ip\":\"%s\",\"currentClients\":%d,\"firmwareVersion\":\"%s\"}",snapshot->device_code, snapshot->wifi_status, snapshot->ip, snapshot->current_clients, snapshot->firmware_version);
+    int written = snprintf(buffer, buffer_size, "{\"deviceCode\":\"%s\",\"status\":%d,\"wifiStatus\":\"%s\",\"ip\":\"%s\",\"currentClients\":%d,\"firmwareVersion\":\"%s\"}",snapshot->device_code, snapshot->status, snapshot->wifi_status, snapshot->ip, snapshot->current_clients, snapshot->firmware_version);
 
     if (written < 0)
     {

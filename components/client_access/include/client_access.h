@@ -54,6 +54,8 @@ bool client_access_can_forward_ipv4(uint32_t source_ip);
 // 将内部状态枚举转换为日志使用的字符串
 const char *client_access_state_to_string(client_access_state_t state);
 // 将指定在线客户端与后端会话绑定，并标记为已认证
-esp_err_t client_access_authorize(const char *mac_text, int64_t session_id);
+esp_err_t client_access_authorize(const char *mac_text, int64_t session_id, uint32_t ttl_seconds);
 // 撤销指定客户端当前会话的认证权限。
 esp_err_t client_access_revoke_authorization(const char *mac_text, int64_t session_id);
+// 周期性扫描所有在线客户端，将已过期的授权状态降为 UNAUTHORIZED。
+void client_access_expire_check(void);
