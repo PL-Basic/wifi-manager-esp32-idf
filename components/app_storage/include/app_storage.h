@@ -27,3 +27,18 @@ esp_err_t app_storage_load_wifi_credentials(app_storage_wifi_credentials_t *cred
 
 // 删除已经保存的上游WiFi凭据，用于恢复配网模式。
 esp_err_t app_storage_clear_wifi_credentials(void);
+
+// 写入 AP 不可达恢复标记，值为 1 表示凭据仍有效但需要进入配网模式
+esp_err_t app_storage_set_recovery_triggered(void);
+
+// 清除 AP 不可达恢复标记
+esp_err_t app_storage_clear_recovery_triggered(void);
+
+// 读取 AP 不可达恢复标记，返回 true 表示上次因 AP 不可达进入了恢复模式
+bool app_storage_is_recovery_triggered(void);
+
+// 将重试计数器加一，与 recovery_triggered 配合使用
+esp_err_t app_storage_increment_recovery_retry(void);
+
+// 读取当前重试计数值。NVS 中无此键时返回 0。
+uint8_t app_storage_get_recovery_retry_count(void);

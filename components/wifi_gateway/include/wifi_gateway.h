@@ -17,6 +17,7 @@ typedef enum
     WIFI_GATEWAY_STATUS_STA_GOT_IP,
     WIFI_GATEWAY_STATUS_STA_DISCONNECTED,
     WIFI_GATEWAY_STATUS_STA_RECOVERY_REQUIRED,
+    WIFI_GATEWAY_STATUS_STA_UNREACHABLE,
 } wifi_gateway_status_t;
 
 //网关启动所需配置
@@ -47,3 +48,5 @@ const char *wifi_gateway_get_sta_ip(void);
 int wifi_gateway_get_current_clients(void);
 // 根据MAC地址断开当前连接到SoftAP的客户端
 esp_err_t wifi_gateway_disconnect_client(const char *mac_text);
+
+void wifi_gateway_set_status(wifi_gateway_status_t status);

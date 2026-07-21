@@ -34,3 +34,7 @@ typedef struct
 
 // 启动本地Captive Portal HTTP服务
 esp_err_t captive_portal_start(const captive_portal_config_t *config);
+
+void captive_portal_set_provisioning_mode(bool provisioning);
+
+

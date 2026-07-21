@@ -19,6 +19,13 @@ static char s_sta_ip[16] = "0.0.0.0";
 static int s_current_clients = 0;
 // 当前连续出现的STA凭据类失败次数。
 static uint8_t s_sta_credential_failure_count = 0;
+// 当前连续出现的STA非凭据类断线次数（AP不存在、超时等），与凭据计数器使用同一阈值
+static uint8_t s_sta_unreachable_count = 0;
+
+void wifi_gateway_set_status(wifi_gateway_status_t status)
+{
+    s_status = status;
+}
 
 static bool is_sta_credential_failure(uint8_t reason)
 {
@@ -74,6 +81,8 @@ const char *wifi_gateway_status_to_string(wifi_gateway_status_t status)
         return "STA_DISCONNECTED";
     case WIFI_GATEWAY_STATUS_STA_RECOVERY_REQUIRED:
         return "STA_RECOVERY_REQUIRED";
+    case WIFI_GATEWAY_STATUS_STA_UNREACHABLE:
+        return "STA_UNREACHABLE";
     default:
         return "UNKNOWN";
     }
@@ -243,6 +252,8 @@ static void wifi_event_handler(void *arg,esp_event_base_t event_base,int32_t eve
     {
         // 已经与上游热点建立WIFI连接，说明当凭据能够完成认证，因此前面的连续凭据失败记录不再有效
         s_sta_credential_failure_count = 0;
+        // 成功连接后，非凭据类断线计数器也同步清零
+        s_sta_unreachable_count = 0;
         s_status = WIFI_GATEWAY_STATUS_STA_CONNECTED;
         ESP_LOGI(TAG,"STA connected");
     } 
@@ -259,7 +270,9 @@ static void wifi_event_handler(void *arg,esp_event_base_t event_base,int32_t eve
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
         const wifi_event_sta_disconnected_t *disconnect_event = (const wifi_event_sta_disconnected_t *)event_data;
-        bool recovery_candidate = false;
+        bool credential_recovery = false;
+        bool unreachable_recovery = false;
+
         if (disconnect_event != NULL)
         {
             bool credential_failure = is_sta_credential_failure(disconnect_event->reason);
@@ -271,21 +284,31 @@ static void wifi_event_handler(void *arg,esp_event_base_t event_base,int32_t eve
                     s_sta_credential_failure_count++;
                 }
             }
+            else
+            {
+                // 非凭据类断线（AP不存在、超时、信号丢失等）：累加独立计数器
+                // 与凭据失败使用同一阈值，避免一种场景需要等另一种场景的 2 倍时间
+                if (s_sta_unreachable_count < STA_CREDENTIAL_FAILURE_LIMIT)
+                {
+                    s_sta_unreachable_count++;
+                }
+            }
+            // 凭据失败达到阈值 → 需要清除凭据后恢复
+            credential_recovery = s_sta_credential_failure_count >= STA_CREDENTIAL_FAILURE_LIMIT;
+            // AP不可达达到阈值 → 需要恢复但保留凭据
+            unreachable_recovery = s_sta_unreachable_count >= STA_CREDENTIAL_FAILURE_LIMIT;
 
-            recovery_candidate = s_sta_credential_failure_count >= STA_CREDENTIAL_FAILURE_LIMIT;
-            
-            // reason用于区分无热点、认证失败、信号丢失等断线原因
-            // rssi表示断线时的上游WiFi信号强度
-            ESP_LOGW(TAG, "STA disconnected, reason=%u, rssi=%d, credential_failure=%s, credential_failures=%u/%u, recovery_candidate=%s", (unsigned)disconnect_event->reason, (int)disconnect_event->rssi, credential_failure ? "true" : "false", (unsigned)s_sta_credential_failure_count, (unsigned)STA_CREDENTIAL_FAILURE_LIMIT, recovery_candidate ? "true" : "false");
+            // 日志中同时报告两种计数器的状态
+            ESP_LOGW(TAG, "STA disconnected, reason=%u, credential_failures=%u, unreachable=%u, limit=%u", (unsigned)disconnect_event->reason, (unsigned)s_sta_credential_failure_count, (unsigned)s_sta_unreachable_count, (unsigned)STA_CREDENTIAL_FAILURE_LIMIT);
         }
         else
         {
             ESP_LOGW(TAG, "STA disconnected without event data");
         }
 
-
         snprintf(s_sta_ip, sizeof(s_sta_ip), "0.0.0.0");
-        if (recovery_candidate)
+        // 凭据类恢复：清 NVS，重启
+        if (credential_recovery)
         {
             // 连续凭据失败已经到达限制
             // 不在继续发送连接请求，等待main.c执行恢复调度
@@ -293,7 +316,16 @@ static void wifi_event_handler(void *arg,esp_event_base_t event_base,int32_t eve
 
             ESP_LOGE(TAG, "STA credential rejected repeatedly, recovery required");
             return;
-        } 
+        }
+
+        // 非凭据类恢复：保留 NVS，仅标记进入配网模式
+        if (unreachable_recovery)
+        {
+            s_status = WIFI_GATEWAY_STATUS_STA_UNREACHABLE;
+            ESP_LOGW(TAG, "STA AP unreachable repeatedly, recovery with retained credentials");
+            return;
+        }
+
         s_status = WIFI_GATEWAY_STATUS_STA_DISCONNECTED;
         esp_err_t err = esp_wifi_connect();
         if (err == ESP_OK)
