@@ -33,6 +33,8 @@ WiFi Manager 系统的 ESP32 嵌入式网关固件。基于 ESP-IDF 6.0.1 和 Pl
 
 **本地配网**：NVS 无凭据或 AP 不可达时，Portal 页面切换为配网表单，浏览器访问热点 IP 即可修改上游 WiFi 凭据，保存后自动重启连接。
 
+**RSSI 信号采集**：上报 STA 侧信号强度（ESP32 到上游路由器）和 SoftAP 客户端信号强度（手机到 ESP32），为后端蹭网检测和 GIS 三角定位提供实时数据。
+
 ## 项目结构
 
 ```
@@ -119,10 +121,11 @@ wifi/device/{deviceCode}/event/status
 {
   "deviceCode": "esp32-gateway-001",
   "status": 1,
+  "rssi": -45,
   "wifiStatus": "STA_GOT_IP",
   "ip": "192.168.137.248",
   "currentClients": 2,
-  "firmwareVersion": "0.1.0"
+  "firmwareVersion": "0.1.1"
 }
 ```
 
@@ -261,7 +264,7 @@ mosquitto_pub -h 192.168.137.1 -p 1883 \
 烧录命令（COM 口根据实际修改）：
 
 ```bash
-esptool.py --chip esp32 --port COM7 --baud 460800 write_flash 0x0 wifi-manager-esp32-v0.1.0.bin
+esptool.py --chip esp32 --port COM7 --baud 460800 write_flash 0x0 wifi-manager-esp32-v0.1.1.bin
 ```
 
 

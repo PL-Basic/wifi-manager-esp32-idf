@@ -506,6 +506,8 @@ void app_main(void)
            }
            // 周期性检查客户端授权是否过期
            client_access_expire_check();
+           // 刷新所有在线客户端的RSSI，为后端蹭网检测和三角定位提供实时数据
+           client_access_update_rssi_all();
        }
 
         vTaskDelay(pdMS_TO_TICKS(10000));

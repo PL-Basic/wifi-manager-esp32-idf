@@ -7,6 +7,7 @@ typedef struct
 {
     const char *device_code;
     int status;
+    int rssi;                // STA到上游路由器的信号强度，单位dBm，GIS定位使用
     const char *wifi_status;
     const char *ip;
     int current_clients;

@@ -33,6 +33,8 @@ typedef struct
     int64_t authorized_at_ticks;
     // 授权有效时长（已转换为tick数），0表示永不过期
     int64_t ttl_ticks;
+    // 客户端到本设备SoftAP的信号强度，单位dBm，用于蹭网检测和三角定位
+    int8_t rssi;
 } client_access_entry_t;
 
 // 传递给TCP/IP任务的ARP查询参数和查询结果。
@@ -484,6 +486,7 @@ static esp_err_t copy_client_snapshot_by_ipv4(uint32_t source_ip, client_access_
 
         snapshot->ipv4 = s_clients[i].ip.addr;
         snapshot->state = s_clients[i].state;
+        snapshot->rssi = s_clients[i].rssi;
 
         result = ESP_OK;
         break;
@@ -751,6 +754,36 @@ void client_access_expire_check(void)
     }
     portEXIT_CRITICAL(&s_clients_lock);
     
+}
+
+// 通过WiFi驱动查询所有SoftAP客户端的实时RSSI，更新内部状态表
+// 由main.c定时调用，为后端蹭网检测和三角定位提供数据
+void client_access_update_rssi_all(void)
+{
+    wifi_sta_list_t station_list = {0};
+
+    // 读取当前连接SoftAP的客户端列表，每条记录包含MAC和RSSI
+    if (esp_wifi_ap_get_sta_list(&station_list) != ESP_OK)
+    {
+        return;  // 查询失败静默返回，不影响主循环
+    }
+
+    if (station_list.num == 0)
+    {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_clients_lock);
+    for (int i = 0; i < station_list.num; i++)
+    {
+        int client_index = find_client_index_locked(station_list.sta[i].mac);
+        if (client_index >= 0)
+        {
+            // 更新该客户端的最新信号强度
+            s_clients[client_index].rssi = station_list.sta[i].rssi;
+        }
+    }
+    portEXIT_CRITICAL(&s_clients_lock);
 }
 
 // 注册事件处理器，并接管后续客户端状态变化

@@ -33,6 +33,9 @@ typedef struct
 
     // 客户端当前的认证状态
     client_access_state_t state;
+
+    // 客户端到本设备SoftAP的信号强度，单位dBm，用于蹭网检测和三角定位
+    int8_t rssi;
 } client_access_snapshot_t;
 
 // 启动客户端状态管理，并监听SoftAP客户端事件
@@ -59,3 +62,5 @@ esp_err_t client_access_authorize(const char *mac_text, int64_t session_id, uint
 esp_err_t client_access_revoke_authorization(const char *mac_text, int64_t session_id);
 // 周期性扫描所有在线客户端，将已过期的授权状态降为 UNAUTHORIZED。
 void client_access_expire_check(void);
+// 通过esp_wifi_ap_get_sta_list()刷新所有在线客户端的RSSI，为后端蹭网检测和三角定位提供实时信号数据
+void client_access_update_rssi_all(void);
