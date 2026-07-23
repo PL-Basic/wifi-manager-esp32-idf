@@ -33,7 +33,7 @@ typedef struct
     int64_t authorized_at_ticks;
     // 授权有效时长（已转换为tick数），0表示永不过期
     int64_t ttl_ticks;
-    // 客户端到本设备SoftAP的信号强度，单位dBm，用于蹭网检测和三角定位
+    // 客户端到本设备SoftAP的信号强度，单位dBm，用于蹭网检测
     int8_t rssi;
 } client_access_entry_t;
 
@@ -114,6 +114,9 @@ static esp_err_t track_connected_client(const uint8_t mac[6])
         s_clients[client_index].session_id = 0;
         // 连接事件发生时DHCP可能还没有分配IP，先清除旧地址
         s_clients[client_index].ip.addr = 0;
+        s_clients[client_index].authorized_at_ticks = 0;
+        s_clients[client_index].ttl_ticks = 0;
+        s_clients[client_index].rssi = 0;
     }
     
     portEXIT_CRITICAL(&s_clients_lock);
@@ -487,6 +490,7 @@ static esp_err_t copy_client_snapshot_by_ipv4(uint32_t source_ip, client_access_
         snapshot->ipv4 = s_clients[i].ip.addr;
         snapshot->state = s_clients[i].state;
         snapshot->rssi = s_clients[i].rssi;
+        snapshot->session_id = s_clients[i].session_id;
 
         result = ESP_OK;
         break;
@@ -624,6 +628,40 @@ const char *client_access_state_to_string(client_access_state_t state)
     }
 }
 
+// 将内部状态表复制到外部数组，供其他模块读取客户端快照
+esp_err_t client_access_copy_snapshots(client_access_snapshot_t *snapshots, size_t capacity, size_t *snapshot_count)
+{
+    if (snapshots == NULL || snapshot_count == NULL || capacity == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *snapshot_count = 0;
+
+    memset(snapshots, 0, sizeof(client_access_snapshot_t) * capacity);
+
+    portENTER_CRITICAL(&s_clients_lock);
+
+    for (int i = 0; i < ESP_WIFI_MAX_CONN_NUM && *snapshot_count < capacity; i++)
+    {
+        if (!s_clients[i].in_use)
+        {
+            continue;
+        }
+
+        client_access_snapshot_t *snapshot = &snapshots[*snapshot_count];
+        memcpy(snapshot->mac, s_clients[i].mac, sizeof(snapshot->mac));
+        snapshot->ipv4 = s_clients[i].ip.addr;
+        snapshot->state = s_clients[i].state;
+        snapshot->session_id = s_clients[i].session_id;
+        snapshot->rssi = s_clients[i].rssi;
+        (*snapshot_count)++;
+    }
+
+    portEXIT_CRITICAL(&s_clients_lock);
+    return ESP_OK;
+}
+
 // 实现授权
 esp_err_t client_access_authorize(const char *mac_text, int64_t session_id, uint32_t ttl_seconds)
 {
@@ -757,33 +795,39 @@ void client_access_expire_check(void)
 }
 
 // 通过WiFi驱动查询所有SoftAP客户端的实时RSSI，更新内部状态表
-// 由main.c定时调用，为后端蹭网检测和三角定位提供数据
-void client_access_update_rssi_all(void)
+// 由main.c定时调用，为后端蹭网检测提供数据
+esp_err_t client_access_update_rssi_all(void)
 {
     wifi_sta_list_t station_list = {0};
-
+    esp_err_t err = esp_wifi_ap_get_sta_list(&station_list);
     // 读取当前连接SoftAP的客户端列表，每条记录包含MAC和RSSI
-    if (esp_wifi_ap_get_sta_list(&station_list) != ESP_OK)
+    if (err != ESP_OK)
     {
-        return;  // 查询失败静默返回，不影响主循环
-    }
-
-    if (station_list.num == 0)
-    {
-        return;
+        return err;  // 查询失败返回错误，不影响主循环
     }
 
     portENTER_CRITICAL(&s_clients_lock);
-    for (int i = 0; i < station_list.num; i++)
+    // 先使上一轮测量失效。
+    for (int i = 0; i < ESP_WIFI_MAX_CONN_NUM; i++)
     {
-        int client_index = find_client_index_locked(station_list.sta[i].mac);
-        if (client_index >= 0)
+        if (s_clients[i].in_use)
         {
-            // 更新该客户端的最新信号强度
-            s_clients[client_index].rssi = station_list.sta[i].rssi;
+            s_clients[i].rssi = 0;
         }
     }
+
+    // 只恢复本轮驱动实际返回的 RSSI。
+    for (int i = 0; i < station_list.num; i++)
+    {
+        int index = find_client_index_locked(station_list.sta[i].mac);
+        if (index >= 0)
+        {
+            s_clients[index].rssi = station_list.sta[i].rssi;
+        }
+    }
+
     portEXIT_CRITICAL(&s_clients_lock);
+    return ESP_OK;
 }
 
 // 注册事件处理器，并接管后续客户端状态变化

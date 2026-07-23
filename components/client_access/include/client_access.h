@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "esp_err.h"
 
@@ -34,26 +35,26 @@ typedef struct
     // 客户端当前的认证状态
     client_access_state_t state;
 
-    // 客户端到本设备SoftAP的信号强度，单位dBm，用于蹭网检测和三角定位
+    // 当前绑定的后端会话，未认证时为 0
+    int64_t session_id;
+
+    // 客户端到本设备SoftAP的信号强度，单位dBm，用于蹭网检测
     int8_t rssi;
 } client_access_snapshot_t;
 
+
+
 // 启动客户端状态管理，并监听SoftAP客户端事件
 esp_err_t client_access_start(void);
-
 // 修改指定在线客户端的访问状态
 esp_err_t client_access_set_state(const uint8_t mac[6], client_access_state_t state);
-
 // 查询指定在线客户端的访问状态
 esp_err_t client_access_get_state(const uint8_t mac[6], client_access_state_t *state);
-
 // 根据客户端IPv4地址读取一份状态快照
 esp_err_t client_access_get_snapshot_by_ipv4(uint32_t source_ip, client_access_snapshot_t *snapshot);
-
 // 这里使用 uint32_t，是因为 IPv4 地址底层就是一个 32 位值。这样公共头文件不需要暴露 lwIP 的内部类型。
 // 根据数据包的源IPv4地址判断对应客户端是否已经获得外网转发权限,只有在线并且状态为AUTHORIZED的客户端才返回true
 bool client_access_can_forward_ipv4(uint32_t source_ip);
-
 // 将内部状态枚举转换为日志使用的字符串
 const char *client_access_state_to_string(client_access_state_t state);
 // 将指定在线客户端与后端会话绑定，并标记为已认证
@@ -62,5 +63,7 @@ esp_err_t client_access_authorize(const char *mac_text, int64_t session_id, uint
 esp_err_t client_access_revoke_authorization(const char *mac_text, int64_t session_id);
 // 周期性扫描所有在线客户端，将已过期的授权状态降为 UNAUTHORIZED。
 void client_access_expire_check(void);
-// 通过esp_wifi_ap_get_sta_list()刷新所有在线客户端的RSSI，为后端蹭网检测和三角定位提供实时信号数据
-void client_access_update_rssi_all(void);
+// 通过esp_wifi_ap_get_sta_list()刷新所有在线客户端的RSSI，为后端蹭网检测提供实时信号数据
+esp_err_t client_access_update_rssi_all(void);
+// 一次性复制当前所有在线客户端，避免外部直接访问内部状态表
+esp_err_t client_access_copy_snapshots(client_access_snapshot_t *snapshots, size_t capacity, size_t *snapshot_count);

@@ -1,5 +1,6 @@
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -29,6 +30,10 @@ static esp_err_t handle_wifi_provisioning(const char *ssid, const char *password
 #define DEVICE_COMMAND_TOPIC "wifi/device/" DEVICE_CODE "/cmd/#"
 // 主题结果返回
 #define DEVICE_COMMAND_RESULT_TOPIC "wifi/device/" DEVICE_CODE "/event/command-result"
+// 主题客户端信号上报
+#define DEVICE_CLIENT_SIGNAL_TOPIC "wifi/device/" DEVICE_CODE "/event/client-signal"
+#define CLIENT_SIGNAL_MAX_CLIENTS 4
+#define CLIENT_SIGNAL_JSON_SIZE 768
 
 static const char *TAG = "app_main";
 
@@ -42,7 +47,7 @@ static wifi_gateway_config_t wifi_config = {
     .sta_password = NULL,
     .ap_ssid = AP_SSID,
     .ap_password = AP_PASSWORD,
-    .ap_max_connection = 4,
+    .ap_max_connection = CLIENT_SIGNAL_MAX_CLIENTS,
 };
 
 static captive_portal_config_t portal_config = {
@@ -66,6 +71,80 @@ app_mqtt_config_t mqtt_config = {
     .command_topic = DEVICE_COMMAND_TOPIC,
     .command_handler = handle_mqtt_command,
 };
+
+static esp_err_t append_json(char *buffer, size_t size, size_t *used, const char *format, ...)
+{
+    if (!buffer || !used || !format || *used >= size)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(buffer + *used, size - *used, format, args);
+    va_end(args);
+
+    if (written < 0)
+    {
+        return ESP_FAIL;
+    }
+    if ((size_t)written >= size - *used)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+    *used += (size_t)written;
+    return ESP_OK;
+}
+
+static esp_err_t publish_client_signals(void)
+{
+    client_access_snapshot_t clients[CLIENT_SIGNAL_MAX_CLIENTS] = {0};
+    size_t count = 0, used = 0, emitted = 0;
+    static char json[CLIENT_SIGNAL_JSON_SIZE];
+
+    esp_err_t err = client_access_copy_snapshots(clients, CLIENT_SIGNAL_MAX_CLIENTS, &count);
+    if (err != ESP_OK || count == 0)
+    {
+        return err;
+    }
+
+    err = append_json(json, sizeof(json), &used, "{\"deviceCode\":\"%s\",\"clients\":[", DEVICE_CODE);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    for (size_t i = 0; i < count; i++)
+    {
+        if (clients[i].rssi >= 0)
+        {
+            continue;
+        }
+
+        err = append_json(json, sizeof(json), &used,
+                          "%s{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
+                          "\"sessionId\":%lld,\"rssi\":%d,\"state\":\"%s\"}",
+                          emitted++ == 0 ? "" : ",",
+                          clients[i].mac[0], clients[i].mac[1], clients[i].mac[2],
+                          clients[i].mac[3], clients[i].mac[4], clients[i].mac[5],
+                          (long long)clients[i].session_id, (int)clients[i].rssi,
+                          client_access_state_to_string(clients[i].state)
+                        );
+
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+
+    if (emitted == 0)
+    {
+        return ESP_OK;
+    }
+
+    err = append_json(json, sizeof(json), &used, "]}");
+    return err == ESP_OK ? app_mqtt_publish(DEVICE_CLIENT_SIGNAL_TOPIC, json) : err;
+}
 
 // 选择正常网关模式使用的开放热点。
 static void select_normal_gateway_mode(void)
@@ -459,6 +538,7 @@ void app_main(void)
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
+
         // 新增：AP 不可达恢复——写标记后重启，不清凭据
         if (wifi_status == WIFI_GATEWAY_STATUS_STA_UNREACHABLE)
         {
@@ -497,6 +577,7 @@ void app_main(void)
                 ESP_LOGE(TAG, "Start MQTT failed: %s", esp_err_to_name(mqtt_err));
             }
         }
+
        if (mqtt_started && wifi_status == WIFI_GATEWAY_STATUS_STA_GOT_IP)
        {
            esp_err_t publish_err = publish_device_status();
@@ -504,12 +585,20 @@ void app_main(void)
            {
                ESP_LOGE(TAG, "Publish device status failed: %s", esp_err_to_name(publish_err));
            }
-           // 周期性检查客户端授权是否过期
-           client_access_expire_check();
-           // 刷新所有在线客户端的RSSI，为后端蹭网检测和三角定位提供实时数据
-           client_access_update_rssi_all();
-       }
 
+           client_access_expire_check();
+           esp_err_t rssi_err = client_access_update_rssi_all();
+           if (rssi_err != ESP_OK)
+           {
+               ESP_LOGE(TAG, "Refresh client RSSI failed: %s", esp_err_to_name(rssi_err));
+           }
+           else
+           {
+               esp_err_t signal_err = publish_client_signals();
+               if (signal_err != ESP_OK)
+                   ESP_LOGE(TAG, "Publish client RSSI failed: %s", esp_err_to_name(signal_err));
+           }
+       }
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
     
