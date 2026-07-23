@@ -264,7 +264,7 @@ mosquitto_pub -h 192.168.137.1 -p 1883 \
 烧录命令（COM 口根据实际修改）：
 
 ```bash
-esptool.py --chip esp32 --port COM7 --baud 460800 write_flash 0x0 wifi-manager-esp32-v0.1.1.bin
+esptool.py --chip esp32 --port COM7 --baud 460800 write_flash 0x0 wifi-manager-esp32-v0.1.2.bin
 ```
 
 
