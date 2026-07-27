@@ -476,6 +476,8 @@ static esp_err_t configure_ap(const wifi_gateway_config_t *config)
     wifi_config_t ap_config = {0};
     strncpy((char *)ap_config.ap.ssid, config->ap_ssid, sizeof(ap_config.ap.ssid) - 1);
     ap_config.ap.ssid_len = strlen(config->ap_ssid);
+    // 三种芯片统一使用兼容性最高的 2.4 GHz 信道 1。
+    // C5 的 5 GHz 属于功能扩展，在后续版本中通过条件编译单独适配。
     ap_config.ap.channel = 1;
     ap_config.ap.max_connection = config->ap_max_connection;
 
@@ -611,7 +613,7 @@ esp_err_t wifi_gateway_start(const wifi_gateway_config_t *config)
     {
         return err;
     }
-    
+
     // 只有存在上游凭据时，才配置STA驱动参数
     if (config->sta_enabled)
     {

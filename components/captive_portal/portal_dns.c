@@ -17,6 +17,7 @@
 
 #include "portal_dns.h"
 #include "client_access.h"
+#include "access_filter.h"
 
 // DNS标准端口
 #define PORTAL_DNS_PORT 53
@@ -42,6 +43,8 @@
 #define DNS_RCODE_SERVER_FAILURE 2
 // DNS应答中的域名使用压缩指针，指回请求中偏移12的位置。
 #define DNS_NAME_POINTER 0xC00C
+// 域名存在，但被本地访问策略明确拒绝。
+#define DNS_RCODE_REFUSED 5
 // Portal假地址只缓存5秒。
 // 认证完成后，旧的192.168.4.1解析结果可以较快失效。
 #define PORTAL_DNS_TTL_SECONDS 5
@@ -273,25 +276,29 @@ static int build_dns_response(const uint8_t *request, size_t request_length, boo
         // 未认证客户端收到的是Portal本地权威回答
         response_flags |= DNS_FLAG_AUTHORITATIVE;
     }
-    
+
     bool has_ipv4_answer = false;
     uint32_t answer_ipv4 = 0;
     uint16_t response_code = 0;
-    
-    if (query_type == DNS_TYPE_A && query_class == DNS_CLASS_IN)
+
+    // 未认证客户端仍需解析到 Portal，阻断规则只作用于已认证客户端。
+    if (client_authorized && query_class == DNS_CLASS_IN && access_filter_is_hostname_blocked(domain_name))
+    {
+        response_code = DNS_RCODE_REFUSED;
+    }
+    else if (query_type == DNS_TYPE_A && query_class == DNS_CLASS_IN)
     {
         if (!client_authorized)
         {
-            // Portal域名必须指向外部服务器，不能继续指向ESP32本机
+            // 外部 Portal 域名必须指向配置的真实服务器。
             if (s_external_portal_enabled && strcasecmp(domain_name, s_external_portal_domain) == 0)
             {
                 answer_ipv4 = s_external_portal_ipv4;
-
                 ESP_LOGI(TAG, "External Portal DNS matched, domain=%s", domain_name);
             }
             else
             {
-                // 其他未认证域名继续指向ESP32本地Portal
+                // 其他未认证域名继续劫持到 ESP32 本地 Portal。
                 answer_ipv4 = s_portal_ipv4;
             }
 
@@ -299,17 +306,17 @@ static int build_dns_response(const uint8_t *request, size_t request_length, boo
         }
         else
         {
-            // 已认证客户端：解析并返回真实外网IPv4地址
-            err = resolve_authorized_ipv4(domain_name, &answer_ipv4);
-        
-            if (err == ESP_OK)
+            // 已认证且未被策略阻断时，返回真实上游地址。
+            esp_err_t resolve_err = resolve_authorized_ipv4( domain_name, &answer_ipv4);
+
+            if (resolve_err == ESP_OK)
             {
                 has_ipv4_answer = true;
             }
             else
             {
                 response_code = DNS_RCODE_SERVER_FAILURE;
-            }   
+            }
         }
     }
 

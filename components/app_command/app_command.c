@@ -10,9 +10,10 @@
 
 static const char *TAG = "app_command";
 
-#define COMMAND_PAYLOAD_BUFFER_SIZE 256
+#define COMMAND_PAYLOAD_BUFFER_SIZE 512
 // MQTT topic 的本地字符串缓冲区大小
 #define COMMAND_TOPIC_BUFFER_SIZE 128
+
 
 // 从MQTT topic 最后一段识别命令类型
 static esp_err_t read_command_type_from_topic(const char *topic, int topic_len, app_command_type_t *type)
@@ -182,12 +183,6 @@ static esp_err_t read_json_int64_field(const char *json, const char *key, int64_
         return ESP_ERR_INVALID_ARG;
     }
 
-    // 后端数据库生成的告警ID应当大于0
-    if (value <= 0)
-    {
-        return ESP_ERR_INVALID_ARG;
-    }
-
     *out = (int64_t)value;
     
     
@@ -289,6 +284,11 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
                 return err;
             }
 
+            if (request->session_id <= 0)
+            {
+                return ESP_ERR_INVALID_ARG;
+            }
+
             // ALLOW 必须包含本次授权的有效时长
             // 固件使用相对时长，而不是直接依赖后端的绝对时间
             err = read_json_int64_field(payload_buffer, "ttlSeconds", &request->ttl_seconds);
@@ -330,6 +330,11 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
                 return err;
             }
 
+            if (request->session_id <= 0)
+            {
+                return ESP_ERR_INVALID_ARG;
+            }
+
             ESP_LOGI(TAG,"REVOKE_ACCESS parsed, mac=%s, sessionId=%lld", request->mac, (long long)request->session_id);
         }
         else if (topic_command_type == APP_COMMAND_TYPE_DISCONNECT_MAC)
@@ -350,6 +355,12 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
                 return err;
             }
 
+            // 自动命令使用真实告警 ID，手动命令使用 0。
+            if (request->alert_id < 0)
+            {
+                return ESP_ERR_INVALID_ARG;
+            }
+
             ESP_LOGI(TAG, "DISCONNECT_MAC parsed, mac=%s, alertId=%lld", request->mac, (long long)request->alert_id);
         }
         else if (topic_command_type == APP_COMMAND_TYPE_KICK)
@@ -367,23 +378,32 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
         }
         else if (topic_command_type == APP_COMMAND_TYPE_BLOCK_TRAFFIC)
         {
-            // 后端 payload 格式：{"dstIp":"1.2.3.4","sni":"example.com","alertId":123}
-            // alertId 必填，关联告警规则
             err = read_json_int64_field(payload_buffer, "alertId", &request->alert_id);
-            if (err != ESP_OK)
+
+            if (err != ESP_OK || request->alert_id < 0)
             {
-                ESP_LOGE(TAG, "Read BLOCK_TRAFFIC alertId failed: %s", esp_err_to_name(err));
-                return err;
+                ESP_LOGE(TAG, "Read BLOCK_TRAFFIC alertId failed");
+                return err == ESP_OK ? ESP_ERR_INVALID_ARG : err;
             }
-            // dstIp 必填，标识要阻断的目标IP
-            err = read_json_string_field(payload_buffer, "dstIp", request->mac, sizeof(request->mac));
+
+            err = read_json_string_field(payload_buffer, "dstIp", request->dst_ip, sizeof(request->dst_ip));
+
             if (err != ESP_OK)
             {
                 ESP_LOGE(TAG, "Read BLOCK_TRAFFIC dstIp failed: %s", esp_err_to_name(err));
                 return err;
             }
 
-            ESP_LOGI(TAG, "BLOCK_TRAFFIC parsed, alertId=%lld, dstIp=%s", (long long)request->alert_id, request->mac);
+            // SNI 是可选元数据，缺失时保持空字符串。
+            err = read_json_string_field(payload_buffer, "sni", request->sni, sizeof(request->sni));
+
+            if (err != ESP_OK && err != ESP_ERR_NOT_FOUND)
+            {
+                ESP_LOGE(TAG, "Read BLOCK_TRAFFIC sni failed: %s", esp_err_to_name(err));
+                return err;
+            }
+
+            ESP_LOGI(TAG, "BLOCK_TRAFFIC parsed, alertId=%lld, dstIp=%s, sni=%s", (long long)request->alert_id, request->dst_ip, request->sni[0] == '\0' ? "-" : request->sni);
         }
 
         ESP_LOGI(TAG,"Formal command recognized:%s",app_command_type_to_string(topic_command_type));

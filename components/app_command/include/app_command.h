@@ -14,6 +14,8 @@
 #define APP_COMMAND_TTL_SECONDS_MIN 1
 // ALLOW 命令允许的最大授权时长，单位：秒
 #define APP_COMMAND_TTL_SECONDS_MAX 86400
+#define APP_COMMAND_DESTINATION_IP_SIZE 46
+#define APP_COMMAND_SNI_SIZE 256
 
 // app_command 将MQTT传来的字符串转换成这个枚举
 typedef enum
@@ -43,7 +45,11 @@ typedef struct
     // 从 topic 识别出的命令类型
     app_command_type_t type;
     // MAC地址
-    char mac[APP_COMMAND_MAC_SIZE];  
+    char mac[APP_COMMAND_MAC_SIZE];
+    // BLOCK_TRAFFIC 的目标 IP，容量兼容后端最长 45 字符输入。
+    char dst_ip[APP_COMMAND_DESTINATION_IP_SIZE];
+    // BLOCK_TRAFFIC 的可选规范化域名阻断目标。
+    char sni[APP_COMMAND_SNI_SIZE];
     // 告警编号
     int64_t alert_id;
     // 后端为本次认证创建的会话编号

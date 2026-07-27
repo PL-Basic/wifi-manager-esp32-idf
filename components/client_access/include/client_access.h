@@ -42,7 +42,19 @@ typedef struct
     int8_t rssi;
 } client_access_snapshot_t;
 
+// 客户端断开前保存的状态快照。
+// 状态表被清空后，MQTT 发布任务仍可安全读取这些数据。
+typedef struct
+{
+    // 断开客户端的六字节 MAC。
+    uint8_t mac[6];
 
+    // 断开前的访问状态。
+    client_access_state_t state;
+
+    // 断开前绑定的后端 Session，未认证时为 0。
+    int64_t session_id;
+} client_access_disconnect_event_t;
 
 // 启动客户端状态管理，并监听SoftAP客户端事件
 esp_err_t client_access_start(void);
@@ -67,3 +79,5 @@ void client_access_expire_check(void);
 esp_err_t client_access_update_rssi_all(void);
 // 一次性复制当前所有在线客户端，避免外部直接访问内部状态表
 esp_err_t client_access_copy_snapshots(client_access_snapshot_t *snapshots, size_t capacity, size_t *snapshot_count);
+// 等待并取出一个客户端断线事件。timeout_ms 使用 UINT32_MAX 时表示永久等待。
+esp_err_t client_access_wait_disconnect_event(client_access_disconnect_event_t *event,uint32_t timeout_ms);

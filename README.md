@@ -44,9 +44,9 @@ src/
 components/
   wifi_gateway/                # STA + SoftAP + NAPT，WiFi 事件处理，状态机
   client_access/               # 客户端 MAC/IP/状态表，TTL 授权与过期
-  access_filter/               # lwIP IPv4 输入钩子，按源 IP 过滤外网数据包
+  access_filter/               # IPv4、DNS、QUIC 与 TCP/TLS SNI 流量过滤
   captive_portal/              # HTTP Server，DNS 劫持（UDP 53），Portal 页面，配网表单
-  portal_dns.c/h               #   独立的 DNS 子模块，支持外部 Portal 域名例外
+  portal_dns.c/h               #   Portal DNS、上游解析与 hostname 策略拒绝
   app_mqtt/                    # MQTT 连接、发布、订阅、命令回调分发
   app_command/                 # 从 MQTT topic 识别命令类型，解析 JSON payload
   device_status/               # 设备状态快照与 JSON 序列化
@@ -125,7 +125,7 @@ wifi/device/{deviceCode}/event/status
   "wifiStatus": "STA_GOT_IP",
   "ip": "192.168.137.248",
   "currentClients": 2,
-  "firmwareVersion": "0.1.1"
+  "firmwareVersion": "0.1.3"
 }
 ```
 
@@ -185,13 +185,29 @@ Topic: `cmd/kick`
 
 固件收到后先返回 command-result，1 秒后执行 `esp_restart()`。
 
-**BLOCK_TRAFFIC** — 全局流量阻断（记录参数，真实阻断待扩展）
+**BLOCK_TRAFFIC** — 安装目标 IP 与可选 hostname 的流量阻断规则
 
 Topic: `cmd/block-traffic`
 
 ```json
-{"alertId":3001,"dstIp":"93.184.216.34"}
+{
+  "requestId": "req-block-1",
+  "alertId": 3001,
+  "dstIp": "93.184.216.34",
+  "sni": "example.com"
+}
 ```
+
+`alertId` 和 `dstIp` 必填，`sni` 可选。命令成功后，目标 IPv4 流量立即被丢弃；配置 `sni` 时同时阻断该 hostname 及其子域名。
+
+为避免通过域名解析或 HTTPS 协议切换绕过规则，固件还会执行以下检查：
+
+- 已认证客户端查询命中 hostname 规则时，DNS 返回 `REFUSED`；未认证客户端仍使用 Portal DNS，未命中规则的已认证客户端仍使用上游 DNS。
+- UDP/443 流量直接拒绝，防止客户端通过 QUIC 绕过 TLS SNI 检查。
+- TCP/443 按连接重组 TLS ClientHello，并根据 SNI 决定放行或阻断。
+- 存在 hostname 规则时，ECH、无 SNI、非法 ClientHello、TCP 序列缺口、IPv4 分片和检查容量耗尽均采用 fail closed。
+
+规则仅保存在 RAM 中，设备重启后清空。当前最多保存 16 条 IPv4 规则、16 条 hostname 规则，并同时检查 12 条 TLS 流。
 
 ## 测试指南
 
@@ -264,7 +280,7 @@ mosquitto_pub -h 192.168.137.1 -p 1883 \
 烧录命令（COM 口根据实际修改）：
 
 ```bash
-esptool.py --chip esp32 --port COM7 --baud 460800 write_flash 0x0 wifi-manager-esp32-v0.1.2.bin
+esptool.py --chip esp32 --port COM7 --baud 460800 write_flash 0x0 wifi-manager-esp32-v0.1.3.bin
 ```
 
 

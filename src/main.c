@@ -32,6 +32,10 @@ static esp_err_t handle_wifi_provisioning(const char *ssid, const char *password
 #define DEVICE_COMMAND_RESULT_TOPIC "wifi/device/" DEVICE_CODE "/event/command-result"
 // 主题客户端信号上报
 #define DEVICE_CLIENT_SIGNAL_TOPIC "wifi/device/" DEVICE_CODE "/event/client-signal"
+#define DEVICE_CLIENT_DISCONNECT_TOPIC "wifi/device/" DEVICE_CODE "/event/client-disconnect"
+
+#define CLIENT_DISCONNECT_JSON_SIZE 256
+#define CLIENT_DISCONNECT_PUBLISH_MAX_ATTEMPTS 3
 #define CLIENT_SIGNAL_MAX_CLIENTS 4
 #define CLIENT_SIGNAL_JSON_SIZE 768
 
@@ -40,6 +44,8 @@ static const char *TAG = "app_main";
 // 保存从NVS读取的上游WiFi凭据。
 // 必须使用静态存储，因为wifi_config中的指针会指向这两个数组。
 static app_storage_wifi_credentials_t s_wifi_credentials = {0};
+// 非 NULL 表示断线事件发布任务已经启动。
+static TaskHandle_t s_client_disconnect_publish_task = NULL;
 
 static wifi_gateway_config_t wifi_config = {
     .sta_enabled = false,
@@ -485,11 +491,21 @@ static void handle_mqtt_command(const char *topic, int topic_len, const char *pa
     }
     case APP_COMMAND_TYPE_BLOCK_TRAFFIC:
     {
-        // BLOCK_TRAFFIC：后端根据告警规则下发目标IP阻断
-        ESP_LOGW(TAG, "BLOCK_TRAFFIC command: alertId=%lld, dstIp=%s", (long long)request.alert_id, request.mac);
+        esp_err_t block_err = access_filter_block_traffic(
+            request.dst_ip,
+            request.sni);
 
-        result.success = true;
-        snprintf(result.message, sizeof(result.message), "block traffic acknowledged, alertId=%lld", (long long)request.alert_id);
+        if (block_err == ESP_OK)
+        {
+            result.success = true;
+            snprintf(result.message,sizeof(result.message),"%s", request.sni[0] != '\0' ? "IPv4 and hostname traffic block installed" : "IPv4 traffic block installed");
+        }
+        else
+        {
+            result.success = false;
+            snprintf(result.message, sizeof(result.message), "block destination failed: %s", esp_err_to_name(block_err));
+        }
+
         break;
     }
     case APP_COMMAND_TYPE_UNKNOWN:
@@ -509,6 +525,99 @@ static void handle_mqtt_command(const char *topic, int topic_len, const char *pa
     
 }
 
+// 将断线快照序列化并发布给后端。
+static esp_err_t publish_client_disconnect(
+    const client_access_disconnect_event_t *event)
+{
+    if (event == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char json[CLIENT_DISCONNECT_JSON_SIZE] = {0};
+
+    int written = snprintf(
+        json,
+        sizeof(json),
+        "{\"deviceCode\":\"%s\","
+        "\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\","
+        "\"sessionId\":%lld,"
+        "\"state\":\"%s\"}",
+        DEVICE_CODE,
+        event->mac[0],
+        event->mac[1],
+        event->mac[2],
+        event->mac[3],
+        event->mac[4],
+        event->mac[5],
+        (long long)event->session_id,
+        client_access_state_to_string(event->state));
+
+    if (written < 0 || (size_t)written >= sizeof(json))
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    return app_mqtt_publish(DEVICE_CLIENT_DISCONNECT_TOPIC, json);
+}
+
+// 阻塞等待断线快照，避免占用轮询 CPU。
+static void client_disconnect_publish_task(void *arg)
+{
+    (void)arg;
+
+    while (true)
+    {
+        client_access_disconnect_event_t event = {0};
+
+        esp_err_t wait_err = client_access_wait_disconnect_event(&event, UINT32_MAX);
+
+        if (wait_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Wait client disconnect event failed: %s", esp_err_to_name(wait_err));
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        esp_err_t publish_err = ESP_FAIL;
+
+        // 只做短暂有限重试；长期失败由后端 RSSI 超时兜底。
+        for (int attempt = 1; attempt <= CLIENT_DISCONNECT_PUBLISH_MAX_ATTEMPTS; attempt++)
+        {
+            publish_err = publish_client_disconnect(&event);
+
+            if (publish_err == ESP_OK)
+            {
+                break;
+            }
+
+            ESP_LOGW(TAG, "Publish client disconnect failed, sessionId=%lld, attempt=%d: %s", (long long)event.session_id, attempt, esp_err_to_name(publish_err));
+
+            if (attempt < CLIENT_DISCONNECT_PUBLISH_MAX_ATTEMPTS)
+            {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+        }
+
+        if (publish_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Client disconnect event abandoned, sessionId=%lld", (long long)event.session_id);
+        }
+    }
+}
+
+// MQTT 启动后创建一次发布任务。
+static esp_err_t start_client_disconnect_publish_task(void)
+{
+    if (s_client_disconnect_publish_task != NULL)
+    {
+        return ESP_OK;
+    }
+
+    BaseType_t created = xTaskCreate(client_disconnect_publish_task, "client_disconnect", 4096, NULL, 4, &s_client_disconnect_publish_task);
+
+    return created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
+}
 
 void app_main(void)
 {
@@ -578,6 +687,17 @@ void app_main(void)
             }
         }
 
+        if (mqtt_started && s_client_disconnect_publish_task == NULL)
+        {
+            esp_err_t task_err = start_client_disconnect_publish_task();
+
+            if (task_err != ESP_OK)
+            {
+                // 主循环每 10 秒会继续尝试，不影响其他固件能力。
+                ESP_LOGE(TAG, "Start client disconnect publish task failed: %s", esp_err_to_name(task_err));
+            }
+        }
+
        if (mqtt_started && wifi_status == WIFI_GATEWAY_STATUS_STA_GOT_IP)
        {
            esp_err_t publish_err = publish_device_status();
@@ -596,7 +716,9 @@ void app_main(void)
            {
                esp_err_t signal_err = publish_client_signals();
                if (signal_err != ESP_OK)
+               {
                    ESP_LOGE(TAG, "Publish client RSSI failed: %s", esp_err_to_name(signal_err));
+               }
            }
        }
         vTaskDelay(pdMS_TO_TICKS(10000));

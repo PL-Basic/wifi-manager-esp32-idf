@@ -5,6 +5,7 @@
 #include "client_access.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 #include "esp_event.h"
 #include "esp_log.h"
@@ -60,6 +61,10 @@ static esp_event_handler_instance_t s_connected_handler;
 static esp_event_handler_instance_t s_disconnected_handler;
 // 保存DHCP分配客户端IP事件的处理器实例
 static esp_event_handler_instance_t s_ip_assigned_handler;
+// 队列容量等于芯片允许的最大 SoftAP 客户端数量。使用静态队列，避免运行期间动态申请内存。
+static StaticQueue_t s_disconnect_queue_control;
+static uint8_t s_disconnect_queue_storage[ESP_WIFI_MAX_CONN_NUM * sizeof(client_access_disconnect_event_t)];
+static QueueHandle_t s_disconnect_queue = NULL;
 
 // 该函数只能在已经进入临界区后调用
 static int find_client_index_locked(const uint8_t mac[6])
@@ -227,7 +232,7 @@ static esp_err_t track_existing_softap_clients(void)
     return ESP_OK;
 }
 
-// 客户端离开SoftAP后，从在线状态表中删除
+// 客户端离开 SoftAP 后，先保存断线快照，再清理在线状态表。
 static void remove_disconnect_client(const uint8_t mac[6])
 {
     if (mac == NULL)
@@ -235,20 +240,56 @@ static void remove_disconnect_client(const uint8_t mac[6])
         return;
     }
 
+    client_access_disconnect_event_t disconnect_event = {0};
+    bool client_found = false;
+
     portENTER_CRITICAL(&s_clients_lock);
-    
+
     int client_index = find_client_index_locked(mac);
 
     if (client_index >= 0)
     {
-        memset(&s_clients[client_index],0,sizeof(s_clients[client_index]));
+        // 必须在 memset 前复制，否则 sessionId 和 state 会永久丢失。
+        memcpy(disconnect_event.mac, s_clients[client_index].mac, sizeof(disconnect_event.mac));
+
+        disconnect_event.state = s_clients[client_index].state;
+        disconnect_event.session_id = s_clients[client_index].session_id;
+
+        memset(&s_clients[client_index], 0, sizeof(s_clients[client_index]));
+
+        client_found = true;
     }
 
     portEXIT_CRITICAL(&s_clients_lock);
 
-    ESP_LOGI(TAG, "Client removed, mac=%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
+    if (!client_found)
+    {
+        ESP_LOGW(
+            TAG,
+            "Disconnected client was not tracked, mac=%02X:%02X:%02X:%02X:%02X:%02X",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        return;
+    }
 
+    // 当前回调运行在事件任务中，不能在这里阻塞等待队列空间。
+    if (s_disconnect_queue == NULL || xQueueSend(s_disconnect_queue, &disconnect_event, 0) != pdPASS)
+    {
+        // 队列失败时后端仍有 RSSI 超时结算作为兜底。
+        ESP_LOGW( TAG, "Client disconnect event queue is full, sessionId=%lld", (long long)disconnect_event.session_id);
+    }
+
+    ESP_LOGI(
+        TAG,
+        "Client removed, mac=%02X:%02X:%02X:%02X:%02X:%02X, state=%s, sessionId=%lld",
+        disconnect_event.mac[0],
+        disconnect_event.mac[1],
+        disconnect_event.mac[2],
+        disconnect_event.mac[3],
+        disconnect_event.mac[4],
+        disconnect_event.mac[5],
+        client_access_state_to_string(disconnect_event.state),
+        (long long)disconnect_event.session_id);
+}
 // 接收ESP-IDF的SoftAP客户端连接和断开事件
 static void client_access_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
@@ -830,6 +871,25 @@ esp_err_t client_access_update_rssi_all(void)
     return ESP_OK;
 }
 
+esp_err_t client_access_wait_disconnect_event(client_access_disconnect_event_t *event, uint32_t timeout_ms)
+{
+    if (event == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (s_disconnect_queue == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    TickType_t wait_ticks = timeout_ms == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+
+    BaseType_t received = xQueueReceive(s_disconnect_queue,event, wait_ticks);
+
+    return received == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
 // 注册事件处理器，并接管后续客户端状态变化
 esp_err_t client_access_start(void)
 {
@@ -837,6 +897,19 @@ esp_err_t client_access_start(void)
     {
         return ESP_OK;
     }
+
+    if (s_disconnect_queue == NULL)
+    {
+        s_disconnect_queue = xQueueCreateStatic( ESP_WIFI_MAX_CONN_NUM, sizeof(client_access_disconnect_event_t),s_disconnect_queue_storage, &s_disconnect_queue_control);
+    }
+
+    if (s_disconnect_queue == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    // 重试启动时清除上一次失败启动期间可能留下的旧事件。
+    xQueueReset(s_disconnect_queue);
 
     esp_err_t err = esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, client_access_event_handler, NULL, &s_connected_handler);
 
