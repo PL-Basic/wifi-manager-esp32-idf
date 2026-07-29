@@ -8,7 +8,7 @@
 #include "esp_wifi.h"
 
 static const char DEVICE_CODE[] = "esp32-gateway-001";
-static const char FIRMWARE_VERSION[] = "0.1.3";
+static const char FIRMWARE_VERSION[] = "0.1.4";
 
 esp_err_t device_status_collect(device_status_snapshot_t *snapshot)
 {
