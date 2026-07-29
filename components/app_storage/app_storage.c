@@ -1,7 +1,10 @@
+#include <stdio.h>
 #include <string.h>
 
 #include "app_storage.h"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -11,12 +14,35 @@
 // namespace内部的两个字段名
 #define APP_STORAGE_WIFI_SSID_KEY "sta_ssid"
 #define APP_STORAGE_WIFI_PASSWORD_KEY "sta_password"
+#define APP_STORAGE_CANDIDATE_SSID_KEY "cand_ssid"
+#define APP_STORAGE_CANDIDATE_PASSWORD_KEY "cand_pass"
+#define APP_STORAGE_CANDIDATE_REQUEST_ID_KEY "cand_req"
+#define APP_STORAGE_CANDIDATE_VERSION_KEY "cand_ver"
+#define APP_STORAGE_ACTIVE_REQUEST_ID_KEY "active_req"
+#define APP_STORAGE_ACTIVE_VERSION_KEY "active_ver"
 // AP不可达恢复标记键名，uint8_t类型，1=恢复模式（凭据保留），0或无此键=正常
 #define APP_STORAGE_RECOVERY_TRIGGERED_KEY "recv_trig"
 // AP不可达自动重试计数器键名，uint8_t类型，每次STA_UNREACHABLE加一
 #define APP_STORAGE_RECOVERY_RETRY_KEY "recv_retry"
 
 static const char *TAG = "app_storage";
+static SemaphoreHandle_t s_wifi_config_mutex = NULL;
+
+static esp_err_t lock_wifi_config(void)
+{
+    if (s_wifi_config_mutex == NULL)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return xSemaphoreTake(s_wifi_config_mutex, portMAX_DELAY) == pdTRUE
+               ? ESP_OK
+               : ESP_ERR_TIMEOUT;
+}
+
+static void unlock_wifi_config(void)
+{
+    xSemaphoreGive(s_wifi_config_mutex);
+}
 
 // 检查调用方提供的上游WiFi平局释放可以安全保存
 static esp_err_t validate_wifi_credentials(const app_storage_wifi_credentials_t *credentials)
@@ -49,6 +75,157 @@ static esp_err_t validate_wifi_credentials(const app_storage_wifi_credentials_t 
         return ESP_ERR_INVALID_ARG;
     }
 
+    return ESP_OK;
+}
+
+static esp_err_t validate_wifi_config(const app_storage_wifi_config_t *config)
+{
+    if (config == NULL || config->config_version == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t request_id_length = strnlen(config->request_id, sizeof(config->request_id));
+    if (request_id_length == 0 || request_id_length >= sizeof(config->request_id))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return validate_wifi_credentials(&config->credentials);
+}
+
+static esp_err_t erase_key_if_present(nvs_handle_t handle, const char *key, bool *changed)
+{
+    esp_err_t err = nvs_erase_key(handle, key);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+    if (err == ESP_OK && changed != NULL)
+    {
+        *changed = true;
+    }
+    return err;
+}
+
+static esp_err_t erase_candidate_from_handle(nvs_handle_t handle, bool *changed)
+{
+    const char *keys[] = {
+        APP_STORAGE_CANDIDATE_SSID_KEY,
+        APP_STORAGE_CANDIDATE_PASSWORD_KEY,
+        APP_STORAGE_CANDIDATE_REQUEST_ID_KEY,
+        APP_STORAGE_CANDIDATE_VERSION_KEY,
+    };
+
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+    {
+        esp_err_t err = erase_key_if_present(handle, keys[i], changed);
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+    return ESP_OK;
+}
+
+static esp_err_t load_candidate_from_handle(
+    nvs_handle_t handle,
+    app_storage_wifi_config_t *config)
+{
+    if (config == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(config, 0, sizeof(*config));
+    size_t ssid_size = sizeof(config->credentials.ssid);
+    size_t password_size = sizeof(config->credentials.password);
+    size_t request_id_size = sizeof(config->request_id);
+
+    esp_err_t err = nvs_get_str(
+        handle,
+        APP_STORAGE_CANDIDATE_SSID_KEY,
+        config->credentials.ssid,
+        &ssid_size);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (err == ESP_OK)
+    {
+        err = nvs_get_str(
+            handle,
+            APP_STORAGE_CANDIDATE_PASSWORD_KEY,
+            config->credentials.password,
+            &password_size);
+    }
+    if (err == ESP_OK)
+    {
+        err = nvs_get_str(
+            handle,
+            APP_STORAGE_CANDIDATE_REQUEST_ID_KEY,
+            config->request_id,
+            &request_id_size);
+    }
+    if (err == ESP_OK)
+    {
+        err = nvs_get_u32(
+            handle,
+            APP_STORAGE_CANDIDATE_VERSION_KEY,
+            &config->config_version);
+    }
+    if (err != ESP_OK)
+    {
+        memset(config, 0, sizeof(*config));
+        return err == ESP_ERR_NVS_NOT_FOUND ? ESP_ERR_INVALID_STATE : err;
+    }
+
+    err = validate_wifi_config(config);
+    if (err != ESP_OK)
+    {
+        memset(config, 0, sizeof(*config));
+    }
+    return err;
+}
+
+static esp_err_t load_metadata_pair(
+    nvs_handle_t handle,
+    const char *request_id_key,
+    const char *version_key,
+    char *request_id,
+    size_t request_id_size,
+    uint32_t *version,
+    bool *present)
+{
+    if (request_id == NULL || request_id_size == 0 || version == NULL || present == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    request_id[0] = '\0';
+    *version = 0;
+    *present = false;
+
+    size_t stored_size = request_id_size;
+    esp_err_t request_err = nvs_get_str(handle, request_id_key, request_id, &stored_size);
+    esp_err_t version_err = nvs_get_u32(handle, version_key, version);
+
+    if (request_err == ESP_ERR_NVS_NOT_FOUND && version_err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+    if (request_err != ESP_OK || version_err != ESP_OK || request_id[0] == '\0' || *version == 0)
+    {
+        request_id[0] = '\0';
+        *version = 0;
+        return request_err != ESP_OK && request_err != ESP_ERR_NVS_NOT_FOUND
+                   ? request_err
+                   : (version_err != ESP_OK && version_err != ESP_ERR_NVS_NOT_FOUND
+                          ? version_err
+                          : ESP_ERR_INVALID_STATE);
+    }
+
+    *present = true;
     return ESP_OK;
 }
 
@@ -120,6 +297,12 @@ esp_err_t app_storage_save_wifi_credentials(const app_storage_wifi_credentials_t
         return err;
     }
 
+    err = lock_wifi_config();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
     nvs_handle_t handle;
 
     // 以可读写模式打开wifi_config命名空间。
@@ -128,6 +311,7 @@ esp_err_t app_storage_save_wifi_credentials(const app_storage_wifi_credentials_t
 
     if (err != ESP_OK)
     {
+        unlock_wifi_config();
         return err;
     }
 
@@ -140,51 +324,37 @@ esp_err_t app_storage_save_wifi_credentials(const app_storage_wifi_credentials_t
         err = nvs_set_str(handle, APP_STORAGE_WIFI_PASSWORD_KEY, credentials->password);
     }
 
-    // 前一步成功后才保存密码和清除恢复标记，避免覆盖真正的错误码。
+    // Portal 新配网代表一份不带 MQTT 版本的新 current，旧控制元数据必须同步清理。
+    bool changed = false;
     if (err == ESP_OK)
     {
-        err = nvs_commit(handle); // 提交凭据保存
-
-        // 凭据保存成功后，自动清除恢复标记（换网或重试都意味着问题已解决）
-        if (err == ESP_OK)
-        {
-            // 擦除 recovery triggered（忽略不存在）
-            esp_err_t erase_err = nvs_erase_key(handle, APP_STORAGE_RECOVERY_TRIGGERED_KEY);
-            if (erase_err == ESP_ERR_NVS_NOT_FOUND)
-            {
-                erase_err = ESP_OK;
-            }
-            // 擦除 retry counter（忽略不存在）
-            esp_err_t retry_err = nvs_erase_key(handle, APP_STORAGE_RECOVERY_RETRY_KEY);
-            if (retry_err == ESP_ERR_NVS_NOT_FOUND)
-            {
-                   retry_err = ESP_OK;
-            }
-            // 如果两个擦除都成功（或不存在），则统一提交；否则记录警告
-            if (erase_err == ESP_OK && retry_err == ESP_OK)
-            {
-                err = nvs_commit(handle); // 集中提交一次
-                if (err != ESP_OK)
-                {
-                    ESP_LOGE(TAG, "Commit recovery clear failed: %s", esp_err_to_name(err));
-                }
-            }
-            else
-            {
-                if (erase_err != ESP_OK)
-                {
-                    ESP_LOGW(TAG, "Erase recovery triggered failed: %s", esp_err_to_name(erase_err));
-                }
-                if (retry_err != ESP_OK)
-                {
-                    ESP_LOGW(TAG, "Erase retry count failed: %s", esp_err_to_name(retry_err));
-                }
-            }
-        }
+        err = erase_candidate_from_handle(handle, &changed);
+    }
+    if (err == ESP_OK)
+    {
+        err = erase_key_if_present(handle, APP_STORAGE_ACTIVE_REQUEST_ID_KEY, &changed);
+    }
+    if (err == ESP_OK)
+    {
+        err = erase_key_if_present(handle, APP_STORAGE_ACTIVE_VERSION_KEY, &changed);
+    }
+    if (err == ESP_OK)
+    {
+        err = erase_key_if_present(handle, APP_STORAGE_RECOVERY_TRIGGERED_KEY, &changed);
+    }
+    if (err == ESP_OK)
+    {
+        err = erase_key_if_present(handle, APP_STORAGE_RECOVERY_RETRY_KEY, &changed);
+    }
+    if (err == ESP_OK)
+    {
+        // current、候选清理和恢复标记清理在同一次提交中生效。
+        err = nvs_commit(handle);
     }
 
     // 只要nvs_open成功，无论后面的操作成功还是失败，都必须关闭句柄
     nvs_close(handle);
+    unlock_wifi_config();
 
     if (err == ESP_OK)
     {
@@ -268,47 +438,349 @@ esp_err_t app_storage_load_wifi_credentials(app_storage_wifi_credentials_t * cre
     return ESP_OK;
 } 
 
-esp_err_t app_storage_clear_wifi_credentials(void)
+esp_err_t app_storage_load_candidate_wifi_config(app_storage_wifi_config_t *config)
 {
-    nvs_handle_t handle;
+    if (config == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
 
-    //删除凭据需要修改NVS，因此必须使用读写模式
-    esp_err_t err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    memset(config, 0, sizeof(*config));
+    esp_err_t err = lock_wifi_config();
     if (err != ESP_OK)
     {
         return err;
     }
 
-    // 删除SSID
-    esp_err_t ssid_err = nvs_erase_key(handle, APP_STORAGE_WIFI_SSID_KEY);
-    // 没有这个key不算失败，因为目标本来就是“确保它不存在”。
-    if (ssid_err != ESP_OK && ssid_err != ESP_ERR_NVS_NOT_FOUND)
+    nvs_handle_t handle;
+    err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
     {
-        nvs_close(handle);
-        return ssid_err;
+        unlock_wifi_config();
+        return ESP_ERR_NOT_FOUND;
     }
-    
-    //删除密码
-    esp_err_t password_err = nvs_erase_key(handle, APP_STORAGE_WIFI_PASSWORD_KEY);
+    if (err != ESP_OK)
+    {
+        unlock_wifi_config();
+        return err;
+    }
 
-    if (password_err != ESP_OK && password_err != ESP_ERR_NVS_NOT_FOUND)
+    err = load_candidate_from_handle(handle, config);
+    nvs_close(handle);
+    unlock_wifi_config();
+    return err;
+}
+
+esp_err_t app_storage_stage_candidate_wifi_config(
+    const app_storage_wifi_config_t *config,
+    app_storage_wifi_stage_result_t *stage_result)
+{
+    if (stage_result == NULL)
     {
-        nvs_close(handle);
-        return password_err;
+        return ESP_ERR_INVALID_ARG;
     }
-    
-    // 只有确实删除过至少一个key时，才提交Flash修改
-    if (ssid_err == ESP_OK || password_err == ESP_OK)
+    *stage_result = APP_STORAGE_WIFI_STAGE_STORED;
+
+    esp_err_t err = validate_wifi_config(config);
+    if (err != ESP_OK)
     {
-        err = nvs_commit(handle);
+        return err;
     }
-    else
+
+    err = lock_wifi_config();
+    if (err != ESP_OK)
     {
-        // 两个key本来旧不存在，当前状态已经满足“没有凭据”
+        return err;
+    }
+
+    nvs_handle_t handle;
+    err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        unlock_wifi_config();
+        return err;
+    }
+
+    app_storage_wifi_config_t pending = {0};
+    bool pending_present = false;
+    err = load_candidate_from_handle(handle, &pending);
+    if (err == ESP_OK)
+    {
+        pending_present = true;
+    }
+    else if (err == ESP_ERR_NOT_FOUND)
+    {
         err = ESP_OK;
     }
 
+    char active_request_id[APP_STORAGE_WIFI_REQUEST_ID_SIZE] = {0};
+    uint32_t active_version = 0;
+    bool active_present = false;
+    if (err == ESP_OK)
+    {
+        err = load_metadata_pair(
+            handle,
+            APP_STORAGE_ACTIVE_REQUEST_ID_KEY,
+            APP_STORAGE_ACTIVE_VERSION_KEY,
+            active_request_id,
+            sizeof(active_request_id),
+            &active_version,
+            &active_present);
+    }
+
+    if (err == ESP_OK && pending_present &&
+        pending.config_version == config->config_version &&
+        strcmp(pending.request_id, config->request_id) == 0)
+    {
+        *stage_result = APP_STORAGE_WIFI_STAGE_IDEMPOTENT;
+        nvs_close(handle);
+        unlock_wifi_config();
+        return ESP_OK;
+    }
+    if (err == ESP_OK && active_present &&
+        active_version == config->config_version &&
+        strcmp(active_request_id, config->request_id) == 0)
+    {
+        *stage_result = APP_STORAGE_WIFI_STAGE_IDEMPOTENT;
+        nvs_close(handle);
+        unlock_wifi_config();
+        return ESP_OK;
+    }
+
+    uint32_t highest_version = 0;
+    if (pending_present && pending.config_version > highest_version)
+    {
+        highest_version = pending.config_version;
+    }
+    if (active_present && active_version > highest_version)
+    {
+        highest_version = active_version;
+    }
+
+    if (err == ESP_OK && config->config_version < highest_version)
+    {
+        *stage_result = APP_STORAGE_WIFI_STAGE_STALE_VERSION;
+        nvs_close(handle);
+        unlock_wifi_config();
+        return ESP_OK;
+    }
+    if (err == ESP_OK && config->config_version == highest_version && highest_version != 0)
+    {
+        *stage_result = APP_STORAGE_WIFI_STAGE_VERSION_CONFLICT;
+        nvs_close(handle);
+        unlock_wifi_config();
+        return ESP_OK;
+    }
+
+    if (err == ESP_OK)
+    {
+        err = nvs_set_str(handle, APP_STORAGE_CANDIDATE_SSID_KEY, config->credentials.ssid);
+    }
+    if (err == ESP_OK)
+    {
+        err = nvs_set_str(handle, APP_STORAGE_CANDIDATE_PASSWORD_KEY, config->credentials.password);
+    }
+    if (err == ESP_OK)
+    {
+        err = nvs_set_str(handle, APP_STORAGE_CANDIDATE_REQUEST_ID_KEY, config->request_id);
+    }
+    if (err == ESP_OK)
+    {
+        err = nvs_set_u32(handle, APP_STORAGE_CANDIDATE_VERSION_KEY, config->config_version);
+    }
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+
     nvs_close(handle);
+    unlock_wifi_config();
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Candidate WiFi configuration stored, requestId=%s, version=%lu",
+                 config->request_id, (unsigned long)config->config_version);
+    }
+    return err;
+}
+
+esp_err_t app_storage_promote_candidate_wifi_config(
+    const char *expected_request_id,
+    uint32_t expected_version)
+{
+    if (expected_request_id == NULL || expected_request_id[0] == '\0' || expected_version == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = lock_wifi_config();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    nvs_handle_t handle;
+    err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        unlock_wifi_config();
+        return err;
+    }
+
+    app_storage_wifi_config_t pending = {0};
+    err = load_candidate_from_handle(handle, &pending);
+    if (err == ESP_OK &&
+        (pending.config_version != expected_version ||
+         strcmp(pending.request_id, expected_request_id) != 0))
+    {
+        err = ESP_ERR_INVALID_STATE;
+    }
+
+    if (err == ESP_OK)
+    {
+        err = nvs_set_str(handle, APP_STORAGE_WIFI_SSID_KEY, pending.credentials.ssid);
+    }
+    if (err == ESP_OK)
+    {
+        err = nvs_set_str(handle, APP_STORAGE_WIFI_PASSWORD_KEY, pending.credentials.password);
+    }
+    if (err == ESP_OK)
+    {
+        err = nvs_set_str(handle, APP_STORAGE_ACTIVE_REQUEST_ID_KEY, pending.request_id);
+    }
+    if (err == ESP_OK)
+    {
+        err = nvs_set_u32(handle, APP_STORAGE_ACTIVE_VERSION_KEY, pending.config_version);
+    }
+
+    bool changed = false;
+    if (err == ESP_OK)
+    {
+        err = erase_candidate_from_handle(handle, &changed);
+    }
+    if (err == ESP_OK)
+    {
+        err = erase_key_if_present(handle, APP_STORAGE_RECOVERY_TRIGGERED_KEY, &changed);
+    }
+    if (err == ESP_OK)
+    {
+        err = erase_key_if_present(handle, APP_STORAGE_RECOVERY_RETRY_KEY, &changed);
+    }
+    if (err == ESP_OK)
+    {
+        // current 写入、active 元数据移动和 candidate 清空必须共用一次提交。
+        err = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+    unlock_wifi_config();
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Candidate WiFi configuration promoted, requestId=%s, version=%lu",
+                 expected_request_id, (unsigned long)expected_version);
+    }
+    return err;
+}
+
+esp_err_t app_storage_load_wifi_config_status(app_storage_wifi_config_status_t *status)
+{
+    if (status == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(status, 0, sizeof(*status));
+    esp_err_t err = lock_wifi_config();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    nvs_handle_t handle;
+    err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        unlock_wifi_config();
+        return ESP_OK;
+    }
+    if (err != ESP_OK)
+    {
+        unlock_wifi_config();
+        return err;
+    }
+
+    bool active_present = false;
+    err = load_metadata_pair(
+        handle,
+        APP_STORAGE_ACTIVE_REQUEST_ID_KEY,
+        APP_STORAGE_ACTIVE_VERSION_KEY,
+        status->active_request_id,
+        sizeof(status->active_request_id),
+        &status->active_version,
+        &active_present);
+
+    app_storage_wifi_config_t pending = {0};
+    if (err == ESP_OK)
+    {
+        esp_err_t pending_err = load_candidate_from_handle(handle, &pending);
+        if (pending_err == ESP_OK)
+        {
+            snprintf(status->pending_request_id, sizeof(status->pending_request_id), "%s", pending.request_id);
+            status->pending_version = pending.config_version;
+        }
+        else if (pending_err != ESP_ERR_NOT_FOUND)
+        {
+            err = pending_err;
+        }
+    }
+
+    nvs_close(handle);
+    unlock_wifi_config();
+    return err;
+}
+
+esp_err_t app_storage_clear_wifi_credentials(void)
+{
+    esp_err_t err = lock_wifi_config();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    nvs_handle_t handle;
+
+    err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        unlock_wifi_config();
+        return ESP_OK;
+    }
+    if (err != ESP_OK)
+    {
+        unlock_wifi_config();
+        return err;
+    }
+
+    bool changed = false;
+    err = erase_key_if_present(handle, APP_STORAGE_WIFI_SSID_KEY, &changed);
+    if (err == ESP_OK)
+    {
+        err = erase_key_if_present(handle, APP_STORAGE_WIFI_PASSWORD_KEY, &changed);
+    }
+    if (err == ESP_OK)
+    {
+        err = erase_key_if_present(handle, APP_STORAGE_ACTIVE_REQUEST_ID_KEY, &changed);
+    }
+    if (err == ESP_OK)
+    {
+        err = erase_key_if_present(handle, APP_STORAGE_ACTIVE_VERSION_KEY, &changed);
+    }
+    if (err == ESP_OK && changed)
+    {
+        err = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+    unlock_wifi_config();
 
     if (err == ESP_OK)
     {
@@ -410,6 +882,15 @@ esp_err_t app_storage_init_nvs(void)
         err = nvs_flash_init();
     }
     
+    if (err == ESP_OK && s_wifi_config_mutex == NULL)
+    {
+        s_wifi_config_mutex = xSemaphoreCreateMutex();
+        if (s_wifi_config_mutex == NULL)
+        {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     if (err == ESP_OK)
     {
         ESP_LOGI(TAG, "NVS initialized");

@@ -38,6 +38,9 @@ typedef struct
 
 esp_err_t wifi_gateway_start(const wifi_gateway_config_t *config);
 
+// 在 STA 已启动后切换上游凭据；仅重连 STA，不重启设备、不影响 SoftAP 配置。
+esp_err_t wifi_gateway_connect_sta(const char *ssid, const char *password);
+
 // getter 方法
 wifi_gateway_status_t wifi_gateway_get_status(void);
 // const 表示只读

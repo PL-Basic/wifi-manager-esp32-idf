@@ -1,6 +1,8 @@
 #pragma once
 #include <stddef.h>
+#include <stdint.h>
 
+#include "app_storage.h"
 #include "esp_err.h"
 
 typedef struct 
@@ -12,6 +14,10 @@ typedef struct
     const char *ip;
     int current_clients;
     const char *firmware_version;
+    char active_wifi_config_request_id[APP_STORAGE_WIFI_REQUEST_ID_SIZE];
+    uint32_t active_wifi_config_version;
+    char pending_wifi_config_request_id[APP_STORAGE_WIFI_REQUEST_ID_SIZE];
+    uint32_t pending_wifi_config_version;
 } device_status_snapshot_t;
 
 // device的状态信息集合

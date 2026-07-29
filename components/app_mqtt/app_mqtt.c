@@ -4,8 +4,12 @@
 
 #include "app_mqtt.h"
 
+#include "freertos/FreeRTOS.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
+
+#define APP_MQTT_COMMAND_TOPIC_SIZE 128
+#define APP_MQTT_COMMAND_PAYLOAD_SIZE 2048
 
 static const char *TAG = "app_mqtt";
 
@@ -13,10 +17,105 @@ static const char *TAG = "app_mqtt";
 static esp_mqtt_client_handle_t s_client = NULL;
 // MQTT 连接标识
 static bool s_connected = false;
+static uint32_t s_connection_generation = 0;
+static portMUX_TYPE s_connection_lock = portMUX_INITIALIZER_UNLOCKED;
 // 接收下发 topic
-static char s_command_topic[128] = {0};
+static char s_command_topic[APP_MQTT_COMMAND_TOPIC_SIZE] = {0};
+static char s_incoming_topic[APP_MQTT_COMMAND_TOPIC_SIZE] = {0};
+static char s_incoming_payload[APP_MQTT_COMMAND_PAYLOAD_SIZE] = {0};
+static int s_incoming_expected = 0;
+static int s_incoming_received = 0;
 
 static app_mqtt_command_handler_t s_command_handler = NULL;
+
+static void set_connection_state(bool connected)
+{
+    portENTER_CRITICAL(&s_connection_lock);
+    s_connected = connected;
+    if (connected)
+    {
+        s_connection_generation++;
+    }
+    portEXIT_CRITICAL(&s_connection_lock);
+}
+
+void app_mqtt_get_connection_state(app_mqtt_connection_state_t *state)
+{
+    if (state == NULL)
+    {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_connection_lock);
+    state->connected = s_connected;
+    state->generation = s_connection_generation;
+    portEXIT_CRITICAL(&s_connection_lock);
+}
+
+static void reset_incoming_command(void)
+{
+    s_incoming_topic[0] = '\0';
+    s_incoming_payload[0] = '\0';
+    s_incoming_expected = 0;
+    s_incoming_received = 0;
+}
+
+static void handle_mqtt_data(esp_mqtt_event_handle_t event)
+{
+    if (event == NULL || event->data == NULL || event->data_len < 0 || event->total_data_len <= 0 ||
+        event->current_data_offset < 0)
+    {
+        reset_incoming_command();
+        return;
+    }
+
+    if (event->current_data_offset == 0)
+    {
+        reset_incoming_command();
+        if (event->topic == NULL || event->topic_len <= 0 ||
+            event->topic_len >= (int)sizeof(s_incoming_topic) ||
+            event->total_data_len >= (int)sizeof(s_incoming_payload))
+        {
+            ESP_LOGW(TAG, "MQTT command dropped, topic_len=%d, payload_len=%d",
+                     event->topic_len, event->total_data_len);
+            return;
+        }
+
+        memcpy(s_incoming_topic, event->topic, event->topic_len);
+        s_incoming_topic[event->topic_len] = '\0';
+        s_incoming_expected = event->total_data_len;
+    }
+
+    if (s_incoming_expected == 0 ||
+        event->current_data_offset != s_incoming_received ||
+        event->current_data_offset + event->data_len > s_incoming_expected)
+    {
+        reset_incoming_command();
+        return;
+    }
+
+    memcpy(
+        s_incoming_payload + event->current_data_offset,
+        event->data,
+        event->data_len);
+    s_incoming_received += event->data_len;
+
+    if (s_incoming_received == s_incoming_expected)
+    {
+        s_incoming_payload[s_incoming_received] = '\0';
+        ESP_LOGI(TAG, "MQTT command received, topic: %s, payload_len=%d",
+                 s_incoming_topic, s_incoming_received);
+        if (s_command_handler != NULL)
+        {
+            s_command_handler(
+                s_incoming_topic,
+                (int)strlen(s_incoming_topic),
+                s_incoming_payload,
+                s_incoming_received);
+        }
+        reset_incoming_command();
+    }
+}
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
@@ -24,7 +123,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id)
     {
     case MQTT_EVENT_CONNECTED:
-        s_connected = true;
+        set_connection_state(true);
         ESP_LOGI(TAG, "MQTT connected");
         int msg_id = esp_mqtt_client_subscribe(s_client, s_command_topic, 1);
         if (msg_id < 0)
@@ -38,7 +137,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
     
     case MQTT_EVENT_DISCONNECTED:
-        s_connected = false;
+        set_connection_state(false);
         ESP_LOGW(TAG, "MQTT disconnected");
         break;
 
@@ -51,12 +150,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         break;
 
     case MQTT_EVENT_DATA:
-        ESP_LOGI(TAG, "MQTT command received, topic: %.*s, payload: %.*s", event->topic_len, event->topic, event->data_len, event->data);
-        if (s_command_handler != NULL)
-        {
-            s_command_handler(event->topic, event->topic_len, event->data, event->data_len);
-        }
-        
+        handle_mqtt_data(event);
         break;
 
     default:
@@ -128,7 +222,9 @@ esp_err_t app_mqtt_publish(const char *topic, const char *payload)
     }
 
     // MQTT 没启动 或者 没连接
-    if (s_client == NULL || !s_connected)
+    app_mqtt_connection_state_t connection = {0};
+    app_mqtt_get_connection_state(&connection);
+    if (s_client == NULL || !connection.connected)
     {
         return ESP_ERR_INVALID_STATE;
     }

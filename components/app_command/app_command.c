@@ -5,12 +5,13 @@
 
 #include "app_command.h"
 
+#include "cJSON.h"
 #include "esp_log.h"
 
 
 static const char *TAG = "app_command";
 
-#define COMMAND_PAYLOAD_BUFFER_SIZE 512
+#define COMMAND_PAYLOAD_BUFFER_SIZE 2048
 // MQTT topic 的本地字符串缓冲区大小
 #define COMMAND_TOPIC_BUFFER_SIZE 128
 
@@ -76,6 +77,12 @@ static esp_err_t read_command_type_from_topic(const char *topic, int topic_len, 
     if (strcmp(command_name, "block-traffic") == 0)
     {
         *type = APP_COMMAND_TYPE_BLOCK_TRAFFIC;
+        return ESP_OK;
+    }
+
+    if (strcmp(command_name, "stage-wifi-config") == 0)
+    {
+        *type = APP_COMMAND_TYPE_STAGE_WIFI_CONFIG;
         return ESP_OK;
     }
 
@@ -189,6 +196,97 @@ static esp_err_t read_json_int64_field(const char *json, const char *key, int64_
     return ESP_OK;
 }
 
+static esp_err_t copy_required_json_string(
+    const cJSON *root,
+    const char *key,
+    char *output,
+    size_t output_size,
+    bool allow_empty)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsString(item) || item->valuestring == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t length = strlen(item->valuestring);
+    if ((!allow_empty && length == 0) || length >= output_size)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memcpy(output, item->valuestring, length + 1);
+    return ESP_OK;
+}
+
+static esp_err_t parse_stage_wifi_config_payload(
+    const char *payload,
+    app_command_request_t *request)
+{
+    const char *parse_end = NULL;
+    cJSON *root = cJSON_ParseWithOpts(payload, &parse_end, true);
+    if (!cJSON_IsObject(root))
+    {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = copy_required_json_string(
+        root, "requestId", request->request_id, sizeof(request->request_id), false);
+    if (err == ESP_OK)
+    {
+        err = copy_required_json_string(
+            root, "deviceCode", request->device_code, sizeof(request->device_code), false);
+    }
+    if (err == ESP_OK)
+    {
+        err = copy_required_json_string(
+            root, "ssid", request->wifi_ssid, sizeof(request->wifi_ssid), false);
+    }
+    if (err == ESP_OK)
+    {
+        err = copy_required_json_string(
+            root, "password", request->wifi_password, sizeof(request->wifi_password), true);
+    }
+
+    const cJSON *version = cJSON_GetObjectItemCaseSensitive(root, "configVersion");
+    if (err == ESP_OK)
+    {
+        if (!cJSON_IsNumber(version) || version->valuedouble < 1.0 ||
+            version->valuedouble > (double)UINT32_MAX)
+        {
+            err = ESP_ERR_INVALID_ARG;
+        }
+        else
+        {
+            uint32_t parsed_version = (uint32_t)version->valuedouble;
+            if ((double)parsed_version != version->valuedouble)
+            {
+                err = ESP_ERR_INVALID_ARG;
+            }
+            else
+            {
+                request->wifi_config_version = parsed_version;
+            }
+        }
+    }
+
+    if (err == ESP_OK)
+    {
+        size_t ssid_length = strlen(request->wifi_ssid);
+        size_t password_length = strlen(request->wifi_password);
+        if (ssid_length < 1 || ssid_length > 32 ||
+            (password_length > 0 && password_length < 8) ||
+            password_length > 63)
+        {
+            err = ESP_ERR_INVALID_ARG;
+        }
+    }
+
+    cJSON_Delete(root);
+    return err;
+}
+
 // 将命令枚举转换为字符串
 // app_command 内部使用枚举，发布MQTT JSON时才会被调用转换字符串
 const char *app_command_type_to_string(app_command_type_t type)
@@ -212,6 +310,9 @@ const char *app_command_type_to_string(app_command_type_t type)
     
     case APP_COMMAND_TYPE_BLOCK_TRAFFIC:
         return "BLOCK_TRAFFIC";
+
+    case APP_COMMAND_TYPE_STAGE_WIFI_CONFIG:
+        return "STAGE_WIFI_CONFIG";
 
     case APP_COMMAND_TYPE_GET_STATUS:
         return "GET_STATUS";
@@ -246,6 +347,14 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
     // 避免没有结束符
     payload_buffer[payload_len] = '\0';
 
+    app_command_type_t topic_command_type = APP_COMMAND_TYPE_UNKNOWN;
+    esp_err_t topic_err = read_command_type_from_topic(topic, topic_len, &topic_command_type);
+    if (topic_err == ESP_OK && topic_command_type == APP_COMMAND_TYPE_STAGE_WIFI_CONFIG)
+    {
+        request->type = APP_COMMAND_TYPE_STAGE_WIFI_CONFIG;
+        return parse_stage_wifi_config_payload(payload_buffer, request);
+    }
+
     // 先尝试读取 requestId。
     // requestId 是后端用来匹配“哪一条命令对应哪一个结果”的。
     // 它不是执行命令的必要字段，所以没有也可以继续。
@@ -257,9 +366,7 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
     }
 
     // 从 MQTT topic 识别后端正式命令
-    app_command_type_t topic_command_type = APP_COMMAND_TYPE_UNKNOWN;
-
-    err = read_command_type_from_topic(topic, topic_len, &topic_command_type);
+    err = topic_err;
     if (err == ESP_OK)
     {
         // 先保存从topic 识别出的命令类型
@@ -426,7 +533,7 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
 
     if (err != ESP_OK)
     {
-        ESP_LOGW(TAG, "Command type not found: %s", payload_buffer);
+        ESP_LOGW(TAG, "Command type not found");
         return err;
     }
 
@@ -448,7 +555,7 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
         return ESP_OK;
     }
 
-    ESP_LOGW(TAG, "Unknown command payload: %s", payload_buffer);
+    ESP_LOGW(TAG, "Unknown command payload");
     return ESP_ERR_NOT_FOUND;
 }
 

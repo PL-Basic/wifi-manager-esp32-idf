@@ -1,6 +1,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -8,6 +9,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "cJSON.h"
 
 #include "app_storage.h"
 #include "wifi_gateway.h"
@@ -44,6 +46,16 @@ static const char *TAG = "app_main";
 // 保存从NVS读取的上游WiFi凭据。
 // 必须使用静态存储，因为wifi_config中的指针会指向这两个数组。
 static app_storage_wifi_credentials_t s_wifi_credentials = {0};
+static app_storage_wifi_config_t s_candidate_config = {0};
+
+typedef enum
+{
+    UPSTREAM_WIFI_SLOT_CURRENT = 0,
+    UPSTREAM_WIFI_SLOT_CANDIDATE,
+} upstream_wifi_slot_t;
+
+static upstream_wifi_slot_t s_upstream_wifi_slot = UPSTREAM_WIFI_SLOT_CURRENT;
+static uint32_t s_candidate_mqtt_generation = 0;
 // 非 NULL 表示断线事件发布任务已经启动。
 static TaskHandle_t s_client_disconnect_publish_task = NULL;
 
@@ -204,6 +216,23 @@ static esp_err_t handle_wifi_provisioning(const char *ssid, const char *password
 // 根据NVS中的上游WiFi凭据，决定网络启动模式
 static esp_err_t prepare_wifi_gateway_config(void)
 {
+    esp_err_t candidate_err = app_storage_load_candidate_wifi_config(&s_candidate_config);
+    if (candidate_err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Pending WiFi configuration found, requestId=%s, version=%lu",
+                 s_candidate_config.request_id,
+                 (unsigned long)s_candidate_config.config_version);
+    }
+    else
+    {
+        memset(&s_candidate_config, 0, sizeof(s_candidate_config));
+        if (candidate_err != ESP_ERR_NOT_FOUND)
+        {
+            ESP_LOGW(TAG, "Pending WiFi configuration is unavailable: %s",
+                     esp_err_to_name(candidate_err));
+        }
+    }
+
     esp_err_t err = app_storage_load_wifi_credentials(&s_wifi_credentials);
 
     if (err == ESP_OK)
@@ -274,30 +303,157 @@ static esp_err_t prepare_wifi_gateway_config(void)
     return err;
 }
 
-// 执行上游WiFi凭据失效后的恢复调度。
+static void enter_retained_wifi_recovery(void)
+{
+    ESP_LOGW(TAG, "Entering provisioning mode with current and candidate WiFi slots retained");
+
+    esp_err_t flag_err = app_storage_set_recovery_triggered();
+    if (flag_err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Set recovery triggered flag failed: %s", esp_err_to_name(flag_err));
+    }
+
+    esp_err_t retry_err = app_storage_increment_recovery_retry();
+    if (retry_err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Increment recovery retry count failed: %s", esp_err_to_name(retry_err));
+    }
+
+    captive_portal_set_provisioning_mode(true);
+    wifi_gateway_set_status(WIFI_GATEWAY_STATUS_PROVISIONING);
+}
+
+static esp_err_t start_candidate_wifi_attempt(void)
+{
+    app_storage_wifi_config_t candidate = {0};
+    esp_err_t err = app_storage_load_candidate_wifi_config(&candidate);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    app_mqtt_connection_state_t mqtt_state = {0};
+    app_mqtt_get_connection_state(&mqtt_state);
+
+    err = wifi_gateway_connect_sta(
+        candidate.credentials.ssid,
+        candidate.credentials.password);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    s_candidate_config = candidate;
+    s_candidate_mqtt_generation = mqtt_state.generation;
+    s_upstream_wifi_slot = UPSTREAM_WIFI_SLOT_CANDIDATE;
+    ESP_LOGW(TAG, "Trying candidate WiFi configuration, requestId=%s, version=%lu",
+             candidate.request_id, (unsigned long)candidate.config_version);
+    return ESP_OK;
+}
+
+// current 达到认证失败阈值后优先切换 candidate；没有 candidate 时保留旧恢复行为。
 static void handle_upstream_wifi_recovery(void)
 {
-    ESP_LOGW(TAG, "Upstream WiFi credentials appear invalid, clearing stored credentials");
-    // 删除已经连续认证失败的上游WIFI凭据
+    if (s_upstream_wifi_slot == UPSTREAM_WIFI_SLOT_CANDIDATE)
+    {
+        enter_retained_wifi_recovery();
+        return;
+    }
+
+    esp_err_t candidate_err = start_candidate_wifi_attempt();
+    if (candidate_err == ESP_OK)
+    {
+        return;
+    }
+    if (candidate_err != ESP_ERR_NOT_FOUND)
+    {
+        ESP_LOGE(TAG, "Candidate WiFi attempt could not start: %s",
+                 esp_err_to_name(candidate_err));
+        enter_retained_wifi_recovery();
+        return;
+    }
+
+    ESP_LOGW(TAG, "Current WiFi credentials rejected and no candidate exists, clearing current slot");
     esp_err_t err = app_storage_clear_wifi_credentials();
 
     if (err != ESP_OK)
     {
-        // 清除失败时不能重启，否则设备重启仍会读取同一份失效凭据，形成重启循环
         ESP_LOGE(TAG, "Clear upstream WiFi credentials failed: %s", esp_err_to_name(err));
         return;
     }
-    ESP_LOGW(TAG, "Upstream WiFi credentials cleared, restarting into provisioning mode");
-    // 给串口日志一点发送时间。
+    ESP_LOGW(TAG, "Current WiFi slot cleared, restarting into provisioning mode");
     vTaskDelay(pdMS_TO_TICKS(500));
-    // 重启不会返回。
     esp_restart();
+}
+
+static void handle_upstream_wifi_unreachable(void)
+{
+    if (s_upstream_wifi_slot == UPSTREAM_WIFI_SLOT_CURRENT)
+    {
+        esp_err_t candidate_err = start_candidate_wifi_attempt();
+        if (candidate_err == ESP_OK)
+        {
+            return;
+        }
+        if (candidate_err != ESP_ERR_NOT_FOUND)
+        {
+            ESP_LOGE(TAG, "Candidate WiFi attempt could not start: %s",
+                     esp_err_to_name(candidate_err));
+        }
+    }
+
+    enter_retained_wifi_recovery();
+}
+
+static void promote_verified_candidate_if_ready(void)
+{
+    if (s_upstream_wifi_slot != UPSTREAM_WIFI_SLOT_CANDIDATE ||
+        wifi_gateway_get_status() != WIFI_GATEWAY_STATUS_STA_GOT_IP)
+    {
+        return;
+    }
+
+    app_mqtt_connection_state_t mqtt_state = {0};
+    app_mqtt_get_connection_state(&mqtt_state);
+    if (!mqtt_state.connected || mqtt_state.generation <= s_candidate_mqtt_generation)
+    {
+        return;
+    }
+
+    esp_err_t err = app_storage_promote_candidate_wifi_config(
+        s_candidate_config.request_id,
+        s_candidate_config.config_version);
+    if (err == ESP_OK)
+    {
+        s_wifi_credentials = s_candidate_config.credentials;
+        memset(&s_candidate_config, 0, sizeof(s_candidate_config));
+        s_upstream_wifi_slot = UPSTREAM_WIFI_SLOT_CURRENT;
+        ESP_LOGI(TAG, "Candidate WiFi configuration activated after IP and MQTT recovery");
+        return;
+    }
+
+    if (err == ESP_ERR_INVALID_STATE)
+    {
+        // 候选尝试期间若收到更高版本，旧尝试不得晋升，改为验证最新候选。
+        ESP_LOGW(TAG, "Pending WiFi configuration changed before promotion, trying latest version");
+        esp_err_t retry_err = start_candidate_wifi_attempt();
+        if (retry_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Start latest candidate WiFi attempt failed: %s",
+                     esp_err_to_name(retry_err));
+            enter_retained_wifi_recovery();
+        }
+        return;
+    }
+
+    // Flash 短暂错误时保留运行态，主循环下次继续尝试原子晋升。
+    ESP_LOGE(TAG, "Promote candidate WiFi configuration failed: %s", esp_err_to_name(err));
 }
 
 static esp_err_t publish_device_status(void)
 {
     device_status_snapshot_t snapshot = {0};
-    char json_buffer[256] = {0};
+    char json_buffer[1280] = {0};
 
     esp_err_t err = device_status_collect(&snapshot);
     if (err != ESP_OK)
@@ -319,16 +475,28 @@ static esp_err_t publish_device_status(void)
 // 发布ping结果
 static esp_err_t publish_command_result(const app_command_result_t *result)
 {
-    char result_buffer[320] = {0};
+    char result_buffer[768] = {0};
     const char *type_text = app_command_type_to_string(result->type);
 
-    int written = snprintf(result_buffer, sizeof(result_buffer), "{\"deviceCode\":\"%s\",\"requestId\":\"%s\",\"type\":\"%s\",\"success\":%s,\"message\":\"%s\"}", DEVICE_CODE, result->request_id, type_text, result->success ? "true" : "false", result->message);
-    if (written < 0)
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL)
     {
-        return ESP_FAIL;
+        return ESP_ERR_NO_MEM;
     }
 
-    if ((size_t)written >= sizeof(result_buffer))
+    bool added =
+        cJSON_AddStringToObject(root, "deviceCode", DEVICE_CODE) != NULL &&
+        cJSON_AddStringToObject(root, "requestId", result->request_id) != NULL &&
+        cJSON_AddStringToObject(root, "type", type_text) != NULL &&
+        cJSON_AddBoolToObject(root, "success", result->success) != NULL &&
+        cJSON_AddStringToObject(root, "message", result->message) != NULL;
+    cJSON_bool printed = added && cJSON_PrintPreallocated(
+                                      root,
+                                      result_buffer,
+                                      sizeof(result_buffer),
+                                      false);
+    cJSON_Delete(root);
+    if (!printed)
     {
         return ESP_ERR_NO_MEM;
     }
@@ -338,7 +506,8 @@ static esp_err_t publish_command_result(const app_command_result_t *result)
 
 static void handle_mqtt_command(const char *topic, int topic_len, const char *payload, int payload_len)
 { 
-    ESP_LOGI(TAG, "Command handler called, topic: %.*s, payload: %.*s", topic_len, topic, payload_len, payload);
+    ESP_LOGI(TAG, "Command handler called, topic: %.*s, payload_len=%d",
+             topic_len, topic, payload_len);
     // request 保存后端发来的命令
     app_command_request_t request = {0};
     // result 保存ESP32 执行后的返回结果
@@ -508,6 +677,52 @@ static void handle_mqtt_command(const char *topic, int topic_len, const char *pa
 
         break;
     }
+    case APP_COMMAND_TYPE_STAGE_WIFI_CONFIG:
+    {
+        if (strcmp(request.device_code, DEVICE_CODE) != 0)
+        {
+            result.success = false;
+            snprintf(result.message, sizeof(result.message), "%s", "device code mismatch");
+            break;
+        }
+
+        app_storage_wifi_config_t candidate = {0};
+        snprintf(candidate.request_id, sizeof(candidate.request_id), "%s", request.request_id);
+        snprintf(candidate.credentials.ssid, sizeof(candidate.credentials.ssid), "%s", request.wifi_ssid);
+        snprintf(candidate.credentials.password, sizeof(candidate.credentials.password), "%s", request.wifi_password);
+        candidate.config_version = request.wifi_config_version;
+
+        app_storage_wifi_stage_result_t stage_result = APP_STORAGE_WIFI_STAGE_STORED;
+        esp_err_t stage_err = app_storage_stage_candidate_wifi_config(
+            &candidate,
+            &stage_result);
+        if (stage_err != ESP_OK)
+        {
+            result.success = false;
+            snprintf(result.message, sizeof(result.message), "%s",
+                     "WiFi configuration storage failed");
+            ESP_LOGE(TAG, "Stage WiFi configuration failed: %s", esp_err_to_name(stage_err));
+        }
+        else if (stage_result == APP_STORAGE_WIFI_STAGE_STALE_VERSION)
+        {
+            result.success = false;
+            snprintf(result.message, sizeof(result.message), "%s",
+                     "stale WiFi configuration version");
+        }
+        else if (stage_result == APP_STORAGE_WIFI_STAGE_VERSION_CONFLICT)
+        {
+            result.success = false;
+            snprintf(result.message, sizeof(result.message), "%s",
+                     "WiFi configuration version conflict");
+        }
+        else
+        {
+            result.success = true;
+            snprintf(result.message, sizeof(result.message), "%s",
+                     "candidate WiFi credentials stored");
+        }
+        break;
+    }
     case APP_COMMAND_TYPE_UNKNOWN:
     default:
         // 理论上未知命令已经被app_command_handle拦截了，这里是额外的安全保护。
@@ -648,27 +863,9 @@ void app_main(void)
             continue;
         }
 
-        // 新增：AP 不可达恢复——写标记后重启，不清凭据
         if (wifi_status == WIFI_GATEWAY_STATUS_STA_UNREACHABLE)
         {
-            ESP_LOGW(TAG, "Upstream WiFi AP unreachable, setting recovery flag and restarting into provisioning mode");
-
-            esp_err_t flag_err = app_storage_set_recovery_triggered();
-            if (flag_err != ESP_OK)
-            {
-                // 写标记失败不应阻止重启，否则设备永久卡在重连循环
-                ESP_LOGE(TAG, "Set recovery triggered flag failed: %s", esp_err_to_name(flag_err));
-            }
-
-            // 增加重试计数器，重启后 prepare_wifi_gateway_config 据此判断是否还允许自动重试
-            esp_err_t retry_err = app_storage_increment_recovery_retry();
-            if (retry_err != ESP_OK)
-            {
-                ESP_LOGE(TAG, "Increment recovery retry count failed: %s", esp_err_to_name(retry_err));
-            }
-            // 切 Portal 为配网页面，不重启设备
-            captive_portal_set_provisioning_mode(true);
-            wifi_gateway_set_status(WIFI_GATEWAY_STATUS_PROVISIONING); // 防止重复触发
+            handle_upstream_wifi_unreachable();
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
@@ -686,6 +883,9 @@ void app_main(void)
                 ESP_LOGE(TAG, "Start MQTT failed: %s", esp_err_to_name(mqtt_err));
             }
         }
+
+        // 候选只有在本次切槽后获得 IP，且观察到一次新的 MQTT_CONNECTED 后才可晋升。
+        promote_verified_candidate_if_ready();
 
         if (mqtt_started && s_client_disconnect_publish_task == NULL)
         {

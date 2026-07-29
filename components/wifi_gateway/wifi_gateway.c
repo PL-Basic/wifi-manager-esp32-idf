@@ -21,6 +21,8 @@ static int s_current_clients = 0;
 static uint8_t s_sta_credential_failure_count = 0;
 // 当前连续出现的STA非凭据类断线次数（AP不存在、超时等），与凭据计数器使用同一阈值
 static uint8_t s_sta_unreachable_count = 0;
+// 主动换槽时忽略由 esp_wifi_disconnect 产生的那次断线计数。
+static volatile bool s_sta_reconfigure_pending = false;
 
 void wifi_gateway_set_status(wifi_gateway_status_t status)
 {
@@ -186,18 +188,18 @@ static esp_err_t validate_config(const wifi_gateway_config_t *config)
     // 正常网关模式必须提供一个非空SSID。
     if (config->sta_enabled)
     {
-        // 判断当前的sta_ssid是否为空或为空字符串
-        if (config->sta_ssid == NULL || strlen(config->sta_ssid) == 0)
+        if (config->sta_ssid == NULL || config->sta_password == NULL)
         {
-            ESP_LOGE(TAG, "STA SSID is empty");
+            ESP_LOGE(TAG, "STA credentials are missing");
             return ESP_ERR_INVALID_ARG;
         }
 
-        // 上游网络允许开放式WiFi，密码可以是空字符串。
-        // 但调用方不能传NULL，因为后续配置函数会读取它。
-        if (config->sta_password == NULL)
+        size_t ssid_length = strnlen(config->sta_ssid, 33);
+        size_t password_length = strnlen(config->sta_password, 64);
+        if (ssid_length == 0 || ssid_length > 32 || password_length > 63 ||
+            (password_length > 0 && password_length < 8))
         {
-            ESP_LOGE(TAG, "STA password is NULL");
+            ESP_LOGE(TAG, "STA credential length is invalid");
             return ESP_ERR_INVALID_ARG;
         }
     }
@@ -270,6 +272,26 @@ static void wifi_event_handler(void *arg,esp_event_base_t event_base,int32_t eve
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
     {
         const wifi_event_sta_disconnected_t *disconnect_event = (const wifi_event_sta_disconnected_t *)event_data;
+
+        if (s_sta_reconfigure_pending)
+        {
+            s_sta_reconfigure_pending = false;
+            s_sta_credential_failure_count = 0;
+            s_sta_unreachable_count = 0;
+            snprintf(s_sta_ip, sizeof(s_sta_ip), "0.0.0.0");
+
+            esp_err_t reconnect_err = esp_wifi_connect();
+            s_status = reconnect_err == ESP_OK
+                           ? WIFI_GATEWAY_STATUS_STA_CONNECTING
+                           : WIFI_GATEWAY_STATUS_STA_DISCONNECTED;
+            if (reconnect_err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "Connect after STA reconfiguration failed: %s",
+                         esp_err_to_name(reconnect_err));
+            }
+            return;
+        }
+
         bool credential_recovery = false;
         bool unreachable_recovery = false;
 
@@ -397,6 +419,14 @@ static esp_err_t init_wifi_driver(void)
         return err;
     }
 
+    // 上游凭据只由 app_storage 双槽管理，避免 WiFi 驱动另存一份候选配置。
+    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Set WiFi storage mode failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
     // 打印驱动初始化
     ESP_LOGI(TAG, "WIFI driver initialized");
 
@@ -438,22 +468,29 @@ static esp_err_t create_wifi_netifs(bool sta_enabled, esp_netif_t **ap_netif)
     return ESP_OK;
 }
 
-static esp_err_t configure_sta(const wifi_gateway_config_t *config)
+static esp_err_t configure_sta_credentials(const char *ssid, const char *password)
 {
-    if (config == NULL)
+    wifi_gateway_config_t validation_config = {
+        .sta_enabled = true,
+        .sta_ssid = ssid,
+        .sta_password = password,
+        .ap_ssid = "validation",
+        .ap_password = "",
+        .ap_max_connection = 1,
+    };
+    esp_err_t err = validate_config(&validation_config);
+    if (err != ESP_OK)
     {
-        ESP_LOGE(TAG,"Config is null");
-        return ESP_ERR_INVALID_ARG;
+        return err;
     }
-    
-    // 给wifi驱动使用的sta配置结构体赋值
-    // 先将WIFI配置结构体清零
-    wifi_config_t sta_config = {0};
-    strncpy((char *)sta_config.sta.ssid, config->sta_ssid, sizeof(sta_config.sta.ssid) - 1);
-    strncpy((char *)sta_config.sta.password, config->sta_password, sizeof(sta_config.sta.password) - 1);
 
-    // 设置该配置，配置的是驱动中的sta参数
-    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
+    wifi_config_t sta_config = {0};
+    size_t ssid_length = strlen(ssid);
+    size_t password_length = strlen(password);
+    memcpy(sta_config.sta.ssid, ssid, ssid_length);
+    memcpy(sta_config.sta.password, password, password_length);
+
+    err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Set sta config failed: %s", esp_err_to_name(err));
@@ -461,6 +498,15 @@ static esp_err_t configure_sta(const wifi_gateway_config_t *config)
     }
 
     return ESP_OK;
+}
+
+static esp_err_t configure_sta(const wifi_gateway_config_t *config)
+{
+    if (config == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return configure_sta_credentials(config->sta_ssid, config->sta_password);
 }
 
 static esp_err_t configure_ap(const wifi_gateway_config_t *config)
@@ -565,6 +611,37 @@ static esp_err_t connect_sta(void)
     s_status = WIFI_GATEWAY_STATUS_STA_CONNECTING;
     ESP_LOGI(TAG, "STA connect requested");
     return ESP_OK;
+}
+
+esp_err_t wifi_gateway_connect_sta(const char *ssid, const char *password)
+{
+    esp_err_t err = configure_sta_credentials(ssid, password);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    s_sta_credential_failure_count = 0;
+    s_sta_unreachable_count = 0;
+    snprintf(s_sta_ip, sizeof(s_sta_ip), "0.0.0.0");
+    s_sta_reconfigure_pending = true;
+
+    err = esp_wifi_disconnect();
+    if (err == ESP_OK)
+    {
+        s_status = WIFI_GATEWAY_STATUS_STA_CONNECTING;
+        ESP_LOGI(TAG, "STA credential slot reconfiguration requested");
+        return ESP_OK;
+    }
+
+    s_sta_reconfigure_pending = false;
+    if (err != ESP_ERR_WIFI_NOT_CONNECT)
+    {
+        ESP_LOGE(TAG, "Disconnect before STA reconfiguration failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    return connect_sta();
 }
 
 

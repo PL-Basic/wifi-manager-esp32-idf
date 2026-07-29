@@ -16,6 +16,9 @@
 #define APP_COMMAND_TTL_SECONDS_MAX 86400
 #define APP_COMMAND_DESTINATION_IP_SIZE 46
 #define APP_COMMAND_SNI_SIZE 256
+#define APP_COMMAND_DEVICE_CODE_SIZE 64
+#define APP_COMMAND_WIFI_SSID_SIZE 33
+#define APP_COMMAND_WIFI_PASSWORD_SIZE 64
 
 // app_command 将MQTT传来的字符串转换成这个枚举
 typedef enum
@@ -29,6 +32,7 @@ typedef enum
     APP_COMMAND_TYPE_KICK,
     APP_COMMAND_TYPE_DISCONNECT_MAC,
     APP_COMMAND_TYPE_BLOCK_TRAFFIC,
+    APP_COMMAND_TYPE_STAGE_WIFI_CONFIG,
     
     // 用于固件链路的测试命令
     // 测试ESP32与后端之间的命令链路
@@ -50,6 +54,11 @@ typedef struct
     char dst_ip[APP_COMMAND_DESTINATION_IP_SIZE];
     // BLOCK_TRAFFIC 的可选规范化域名阻断目标。
     char sni[APP_COMMAND_SNI_SIZE];
+    // STAGE_WIFI_CONFIG 的目标设备与双槽候选配置。
+    char device_code[APP_COMMAND_DEVICE_CODE_SIZE];
+    char wifi_ssid[APP_COMMAND_WIFI_SSID_SIZE];
+    char wifi_password[APP_COMMAND_WIFI_PASSWORD_SIZE];
+    uint32_t wifi_config_version;
     // 告警编号
     int64_t alert_id;
     // 后端为本次认证创建的会话编号
