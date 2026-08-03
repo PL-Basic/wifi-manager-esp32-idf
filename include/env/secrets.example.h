@@ -1,7 +1,7 @@
 #pragma once
 
-#define PORTAL_EXTERNAL_URL "https://portal.example.com/"
-#define PORTAL_EXTERNAL_DOMAIN "portal.example.com"
+#define PORTAL_EXTERNAL_URL "http://portal.test:5173/portal"
+#define PORTAL_EXTERNAL_DOMAIN "portal.test"
 #define PORTAL_SERVER_IPV4 "your_portal_server_ipv4"
 
 // 普通客户端认证热点：保持开放，无需WiFi密码。

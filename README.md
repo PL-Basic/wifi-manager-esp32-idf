@@ -27,7 +27,7 @@ WiFi Manager 系统的 ESP32 嵌入式网关固件。基于 ESP-IDF 6.0.1 和 Pl
 
 **会话管理**：每个授权有 TTL（1-86400 秒），到期自动撤销。双重过期机制：数据包到达时即时检查（惰性），每 10 秒扫描兜底（周期性）。
 
-**MQTT 命令**：支持 5 种命令——ALLOW（放行客户端）、DISCONNECT_MAC（断开客户端）、REVOKE_ACCESS（撤销认证）、KICK（设备复位）、BLOCK_TRAFFIC（流量阻断）。
+**MQTT 命令**：支持 6 种生产命令——ALLOW（放行客户端）、DISCONNECT_MAC（断开客户端）、REVOKE_ACCESS（撤销认证）、KICK（设备复位）、BLOCK_TRAFFIC（流量阻断）、STAGE_WIFI_CONFIG（暂存上游 WiFi 候选配置）。
 
 **上游 WiFi 恢复**：密码错误自动清凭据进配网模式。AP 暂时不可达（路由器关机）保留凭据，每次重启自动重试，多次失败后切换配网页面等人操作。
 
@@ -80,10 +80,12 @@ VS Code 安装 PlatformIO 扩展。用 PlatformIO 打开本项目。
 #define DEVICE_CODE "esp32-gateway-001"
 
 // 外部 Portal 地址（后续前端实现后可配置真实地址）
-#define PORTAL_EXTERNAL_URL "https://portal.example.com/"
-#define PORTAL_EXTERNAL_DOMAIN "portal.example.com"
+#define PORTAL_EXTERNAL_URL "http://portal.test:5173/portal"
+#define PORTAL_EXTERNAL_DOMAIN "portal.test"
 #define PORTAL_SERVER_IPV4 "192.168.137.1"
 ```
+
+上述 Portal 配置是开发局域网示例。`PORTAL_SERVER_IPV4` 必须替换为连接 ESP32 SoftAP 的客户端能够访问到的前端主机地址，并让 `portal.test` 解析到该地址。生产环境必须改为真实 HTTPS Portal URL、对应的完整域名以及匹配的 DNS/TLS 配置。
 
 ### 构建与烧录
 
@@ -208,6 +210,22 @@ Topic: `cmd/block-traffic`
 - 存在 hostname 规则时，ECH、无 SNI、非法 ClientHello、TCP 序列缺口、IPv4 分片和检查容量耗尽均采用 fail closed。
 
 规则仅保存在 RAM 中，设备重启后清空。当前最多保存 16 条 IPv4 规则、16 条 hostname 规则，并同时检查 12 条 TLS 流。
+
+**STAGE_WIFI_CONFIG** — 暂存待验证的上游 WiFi 候选配置
+
+Topic: `cmd/stage-wifi-config`
+
+```json
+{
+  "requestId": "req-wifi-1",
+  "deviceCode": "esp32-gateway-001",
+  "configVersion": 1,
+  "ssid": "Home-WiFi",
+  "password": "change-this-password"
+}
+```
+
+`requestId`、`deviceCode`、`ssid`、`password` 和 `configVersion` 均为必填字段。SSID 为 1-32 字节；开放网络密码为空，否则密码为 8-63 字节；`configVersion` 范围为 1-4294967295。完整协议边界与后端对照见 `docs/firmware-contract-audit.md`。
 
 ## 测试指南
 
