@@ -281,8 +281,19 @@ static int build_dns_response(const uint8_t *request, size_t request_length, boo
     uint32_t answer_ipv4 = 0;
     uint16_t response_code = 0;
 
+    // 外部 Portal 是管理控制面。客户端认证前后都必须保持同一地址，
+    // 否则开发域名在 ALLOW 后改走上游 DNS 会立即失去解析能力。
+    if (query_type == DNS_TYPE_A
+        && query_class == DNS_CLASS_IN
+        && s_external_portal_enabled
+        && strcasecmp(domain_name, s_external_portal_domain) == 0)
+    {
+        answer_ipv4 = s_external_portal_ipv4;
+        has_ipv4_answer = true;
+        ESP_LOGI(TAG, "External Portal DNS matched, domain=%s, authorized=%d", domain_name, client_authorized);
+    }
     // 未认证客户端仍需解析到 Portal，阻断规则只作用于已认证客户端。
-    if (client_authorized && query_class == DNS_CLASS_IN && access_filter_is_hostname_blocked(domain_name))
+    else if (client_authorized && query_class == DNS_CLASS_IN && access_filter_is_hostname_blocked(domain_name))
     {
         response_code = DNS_RCODE_REFUSED;
     }
@@ -290,18 +301,9 @@ static int build_dns_response(const uint8_t *request, size_t request_length, boo
     {
         if (!client_authorized)
         {
-            // 外部 Portal 域名必须指向配置的真实服务器。
-            if (s_external_portal_enabled && strcasecmp(domain_name, s_external_portal_domain) == 0)
-            {
-                answer_ipv4 = s_external_portal_ipv4;
-                ESP_LOGI(TAG, "External Portal DNS matched, domain=%s", domain_name);
-            }
-            else
-            {
-                // 其他未认证域名继续劫持到 ESP32 本地 Portal。
-                answer_ipv4 = s_portal_ipv4;
-            }
-
+            // 外部 Portal 已在前面的固定映射分支处理；
+            // 其他未认证域名继续劫持到 ESP32 本地 Portal。
+            answer_ipv4 = s_portal_ipv4;
             has_ipv4_answer = true;
         }
         else

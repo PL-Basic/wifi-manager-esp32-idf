@@ -263,6 +263,8 @@ mosquitto_pub -h 192.168.137.1 -p 1883 \
 
 手机立即恢复外网访问。订阅 `event/command-result` 应收到 `"type":"ALLOW","success":true`。
 
+保持认证页面打开并进入“我的权益”等站内页面；`portal.test` 在认证后仍应解析到 `PORTAL_SERVER_IPV4`，页面的 `/api` 请求继续成功，不得出现“服务不可达”。外部 Portal 域名属于管理控制面固定映射，只有其他域名在认证后改用上游 DNS。
+
 30 秒后手机刷新外网页面，应无法访问。串口日志出现 `Client authorization expired`。
 
 **周期过期测试**：下发 ttlSeconds=10 的 ALLOW，立即锁屏手机（停止网络活动）。15-20 秒后日志出现 `Client authorization expired (periodic)`，解锁后手机无法上网。
