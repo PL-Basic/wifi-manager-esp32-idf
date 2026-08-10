@@ -14,3 +14,4 @@ sdkconfig.old
 sdkconfig.*
 !sdkconfig.defaults
 release/
+test-results/
