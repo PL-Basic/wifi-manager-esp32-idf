@@ -287,6 +287,44 @@ static esp_err_t parse_stage_wifi_config_payload(
     return err;
 }
 
+static esp_err_t parse_kick_reason(
+    const char *payload,
+    app_command_request_t *request)
+{
+    const char *parse_end = NULL;
+    cJSON *root = cJSON_ParseWithOpts(payload, &parse_end, true);
+    if (!cJSON_IsObject(root))
+    {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const cJSON *reason = cJSON_GetObjectItemCaseSensitive(root, "reason");
+    esp_err_t err = ESP_OK;
+    if (reason != NULL)
+    {
+        if (!cJSON_IsString(reason) || reason->valuestring == NULL)
+        {
+            err = ESP_ERR_INVALID_ARG;
+        }
+        else
+        {
+            size_t length = strlen(reason->valuestring);
+            if (length >= sizeof(request->reason))
+            {
+                err = ESP_ERR_INVALID_ARG;
+            }
+            else
+            {
+                memcpy(request->reason, reason->valuestring, length + 1);
+            }
+        }
+    }
+
+    cJSON_Delete(root);
+    return err;
+}
+
 // 将命令枚举转换为字符串
 // app_command 内部使用枚举，发布MQTT JSON时才会被调用转换字符串
 const char *app_command_type_to_string(app_command_type_t type)
@@ -474,14 +512,14 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
         {
             // 后端 payload 格式：{"deviceCode":"...","reason":"..."}
             // reason 字段可选，缺失时不报错，仅记录为空
-            err = read_json_string_field(payload_buffer, "reason", request->mac, sizeof(request->mac));
-            if (err != ESP_OK && err != ESP_ERR_NOT_FOUND)
+            err = parse_kick_reason(payload_buffer, request);
+            if (err != ESP_OK)
             {
                 ESP_LOGE(TAG, "Read KICK reason failed: %s", esp_err_to_name(err));
                 return err;
             }
 
-            ESP_LOGI(TAG, "KICK parsed, reason=%s", request->mac);
+            ESP_LOGI(TAG, "KICK parsed, reason_len=%u", (unsigned)strlen(request->reason));
         }
         else if (topic_command_type == APP_COMMAND_TYPE_BLOCK_TRAFFIC)
         {

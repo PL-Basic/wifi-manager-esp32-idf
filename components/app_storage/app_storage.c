@@ -24,9 +24,22 @@
 #define APP_STORAGE_RECOVERY_TRIGGERED_KEY "recv_trig"
 // AP不可达自动重试计数器键名，uint8_t类型，每次STA_UNREACHABLE加一
 #define APP_STORAGE_RECOVERY_RETRY_KEY "recv_retry"
+#define APP_STORAGE_COMMAND_RESULT_NAMESPACE "cmd_result"
+#define APP_STORAGE_COMMAND_RESULT_NEXT_KEY "next"
+#define APP_STORAGE_COMMAND_RESULT_CACHE_SIZE 16
+#define APP_STORAGE_COMMAND_RESULT_RECORD_VERSION 1
 
 static const char *TAG = "app_storage";
 static SemaphoreHandle_t s_wifi_config_mutex = NULL;
+
+typedef struct
+{
+    uint32_t version;
+    char request_id[APP_COMMAND_REQUEST_ID_SIZE];
+    uint32_t type;
+    uint8_t success;
+    char message[APP_COMMAND_MESSAGE_SIZE];
+} app_storage_command_result_record_t;
 
 static esp_err_t lock_wifi_config(void)
 {
@@ -42,6 +55,68 @@ static esp_err_t lock_wifi_config(void)
 static void unlock_wifi_config(void)
 {
     xSemaphoreGive(s_wifi_config_mutex);
+}
+
+static bool is_production_command_type(app_command_type_t type)
+{
+    return type >= APP_COMMAND_TYPE_ALLOW &&
+           type <= APP_COMMAND_TYPE_STAGE_WIFI_CONFIG;
+}
+
+static bool command_result_is_valid(const app_command_result_t *result)
+{
+    if (result == NULL || !is_production_command_type(result->type))
+    {
+        return false;
+    }
+
+    size_t request_id_length =
+        strnlen(result->request_id, sizeof(result->request_id));
+    size_t message_length =
+        strnlen(result->message, sizeof(result->message));
+    return request_id_length > 0 &&
+           request_id_length < sizeof(result->request_id) &&
+           message_length < sizeof(result->message);
+}
+
+static void command_result_slot_key(
+    uint8_t slot,
+    char *key,
+    size_t key_size)
+{
+    snprintf(key, key_size, "result_%02u", (unsigned)slot);
+}
+
+static esp_err_t load_command_result_record(
+    nvs_handle_t handle,
+    uint8_t slot,
+    app_storage_command_result_record_t *record)
+{
+    char key[16] = {0};
+    command_result_slot_key(slot, key, sizeof(key));
+    memset(record, 0, sizeof(*record));
+    size_t size = sizeof(*record);
+    return nvs_get_blob(handle, key, record, &size);
+}
+
+static bool command_result_record_is_valid(
+    const app_storage_command_result_record_t *record)
+{
+    if (record == NULL ||
+        record->version != APP_STORAGE_COMMAND_RESULT_RECORD_VERSION ||
+        record->type < (uint32_t)APP_COMMAND_TYPE_ALLOW ||
+        record->type > (uint32_t)APP_COMMAND_TYPE_STAGE_WIFI_CONFIG)
+    {
+        return false;
+    }
+
+    size_t request_id_length =
+        strnlen(record->request_id, sizeof(record->request_id));
+    size_t message_length =
+        strnlen(record->message, sizeof(record->message));
+    return request_id_length > 0 &&
+           request_id_length < sizeof(record->request_id) &&
+           message_length < sizeof(record->message);
 }
 
 // 检查调用方提供的上游WiFi平局释放可以安全保存
@@ -731,6 +806,195 @@ esp_err_t app_storage_load_wifi_config_status(app_storage_wifi_config_status_t *
         {
             err = pending_err;
         }
+    }
+
+    nvs_close(handle);
+    unlock_wifi_config();
+    return err;
+}
+
+esp_err_t app_storage_load_command_result(
+    const char *request_id,
+    app_command_result_t *result)
+{
+    if (request_id == NULL || request_id[0] == '\0' || result == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(result, 0, sizeof(*result));
+    esp_err_t err = lock_wifi_config();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    nvs_handle_t handle;
+    err = nvs_open(
+        APP_STORAGE_COMMAND_RESULT_NAMESPACE,
+        NVS_READONLY,
+        &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        unlock_wifi_config();
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (err != ESP_OK)
+    {
+        unlock_wifi_config();
+        return err;
+    }
+
+    err = ESP_ERR_NOT_FOUND;
+    for (uint8_t slot = 0;
+         slot < APP_STORAGE_COMMAND_RESULT_CACHE_SIZE;
+         slot++)
+    {
+        app_storage_command_result_record_t record = {0};
+        esp_err_t read_err =
+            load_command_result_record(handle, slot, &record);
+        if (read_err == ESP_ERR_NVS_NOT_FOUND)
+        {
+            continue;
+        }
+        if (read_err != ESP_OK)
+        {
+            err = read_err;
+            break;
+        }
+        if (!command_result_record_is_valid(&record))
+        {
+            continue;
+        }
+        if (strcmp(record.request_id, request_id) == 0)
+        {
+            snprintf(
+                result->request_id,
+                sizeof(result->request_id),
+                "%s",
+                record.request_id);
+            result->type = (app_command_type_t)record.type;
+            result->success = record.success != 0;
+            snprintf(
+                result->message,
+                sizeof(result->message),
+                "%s",
+                record.message);
+            err = ESP_OK;
+            break;
+        }
+    }
+
+    nvs_close(handle);
+    unlock_wifi_config();
+    return err;
+}
+
+esp_err_t app_storage_save_command_result(
+    const app_command_result_t *result)
+{
+    if (!command_result_is_valid(result))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = lock_wifi_config();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    nvs_handle_t handle;
+    err = nvs_open(
+        APP_STORAGE_COMMAND_RESULT_NAMESPACE,
+        NVS_READWRITE,
+        &handle);
+    if (err != ESP_OK)
+    {
+        unlock_wifi_config();
+        return err;
+    }
+
+    for (uint8_t slot = 0;
+         slot < APP_STORAGE_COMMAND_RESULT_CACHE_SIZE && err == ESP_OK;
+         slot++)
+    {
+        app_storage_command_result_record_t existing = {0};
+        esp_err_t read_err =
+            load_command_result_record(handle, slot, &existing);
+        if (read_err == ESP_ERR_NVS_NOT_FOUND)
+        {
+            continue;
+        }
+        if (read_err != ESP_OK)
+        {
+            err = read_err;
+            break;
+        }
+        if (command_result_record_is_valid(&existing) &&
+            strcmp(existing.request_id, result->request_id) == 0)
+        {
+            nvs_close(handle);
+            unlock_wifi_config();
+            return ESP_OK;
+        }
+    }
+
+    uint8_t next_slot = 0;
+    if (err == ESP_OK)
+    {
+        esp_err_t next_err = nvs_get_u8(
+            handle,
+            APP_STORAGE_COMMAND_RESULT_NEXT_KEY,
+            &next_slot);
+        if (next_err == ESP_ERR_NVS_NOT_FOUND)
+        {
+            next_slot = 0;
+        }
+        else if (next_err != ESP_OK)
+        {
+            err = next_err;
+        }
+    }
+    if (next_slot >= APP_STORAGE_COMMAND_RESULT_CACHE_SIZE)
+    {
+        next_slot = 0;
+    }
+
+    app_storage_command_result_record_t record = {0};
+    record.version = APP_STORAGE_COMMAND_RESULT_RECORD_VERSION;
+    snprintf(
+        record.request_id,
+        sizeof(record.request_id),
+        "%s",
+        result->request_id);
+    record.type = (uint32_t)result->type;
+    record.success = result->success ? 1 : 0;
+    snprintf(
+        record.message,
+        sizeof(record.message),
+        "%s",
+        result->message);
+
+    char key[16] = {0};
+    command_result_slot_key(next_slot, key, sizeof(key));
+    if (err == ESP_OK)
+    {
+        err = nvs_set_blob(handle, key, &record, sizeof(record));
+    }
+    if (err == ESP_OK)
+    {
+        uint8_t following_slot =
+            (uint8_t)((next_slot + 1) %
+                      APP_STORAGE_COMMAND_RESULT_CACHE_SIZE);
+        err = nvs_set_u8(
+            handle,
+            APP_STORAGE_COMMAND_RESULT_NEXT_KEY,
+            following_slot);
+    }
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
     }
 
     nvs_close(handle);

@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "app_command.h"
 
 // WiFi SSID 最大长度为32字节，额外存一个结束符
 #define APP_STORAGE_WIFI_SSID_SIZE 33
@@ -71,6 +72,15 @@ esp_err_t app_storage_promote_candidate_wifi_config(
 
 // 读取状态上报所需的非敏感控制元数据；缺失的旧键按空值/0 处理。
 esp_err_t app_storage_load_wifi_config_status(app_storage_wifi_config_status_t *status);
+
+// 读取最近生产命令的不可变终态；未命中返回 ESP_ERR_NOT_FOUND。
+esp_err_t app_storage_load_command_result(
+    const char *request_id,
+    app_command_result_t *result);
+
+// 保存最近生产命令的终态；相同 requestId 首次结果保持不变。
+esp_err_t app_storage_save_command_result(
+    const app_command_result_t *result);
 
 // 写入 AP 不可达恢复标记，值为 1 表示凭据仍有效但需要进入配网模式
 esp_err_t app_storage_set_recovery_triggered(void);

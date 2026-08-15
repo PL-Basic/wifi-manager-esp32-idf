@@ -10,6 +10,8 @@
 #define APP_COMMAND_MESSAGE_SIZE 96
 // 标准 MAC 地址有 17 个可见字符，最后还需要一个 '\0'
 #define APP_COMMAND_MAC_SIZE 18
+// KICK 原因最多 255 个 UTF-8 字节，最后还需要一个 '\0'
+#define APP_COMMAND_REASON_SIZE 256
 // ALLOW 命令允许的最小授权时长，单位：秒
 #define APP_COMMAND_TTL_SECONDS_MIN 1
 // ALLOW 命令允许的最大授权时长，单位：秒
@@ -50,6 +52,8 @@ typedef struct
     app_command_type_t type;
     // MAC地址
     char mac[APP_COMMAND_MAC_SIZE];
+    // KICK 的可选原因，不再复用 MAC 缓冲区
+    char reason[APP_COMMAND_REASON_SIZE];
     // BLOCK_TRAFFIC 的目标 IP，容量兼容后端最长 45 字符输入。
     char dst_ip[APP_COMMAND_DESTINATION_IP_SIZE];
     // BLOCK_TRAFFIC 的可选规范化域名阻断目标。

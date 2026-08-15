@@ -166,7 +166,7 @@ Topic: `cmd/allow`
 Topic: `cmd/disconnect-mac`
 
 ```json
-{"mac":"AA:BB:CC:DD:EE:FF","alertId":2001}
+{"requestId":"req-disconnect-1","mac":"AA:BB:CC:DD:EE:FF","alertId":2001}
 ```
 
 **REVOKE_ACCESS** — 撤销客户端认证（不断开连接）
@@ -174,7 +174,7 @@ Topic: `cmd/disconnect-mac`
 Topic: `cmd/revoke-access`
 
 ```json
-{"mac":"AA:BB:CC:DD:EE:FF","sessionId":1001}
+{"requestId":"req-revoke-1","mac":"AA:BB:CC:DD:EE:FF","sessionId":1001}
 ```
 
 **KICK** — 设备安全复位
@@ -182,10 +182,11 @@ Topic: `cmd/revoke-access`
 Topic: `cmd/kick`
 
 ```json
-{"deviceCode":"esp32-gateway-001","reason":"security incident"}
+{"requestId":"req-kick-1","deviceCode":"esp32-gateway-001","reason":"security incident"}
 ```
 
-固件收到后先返回 command-result，1 秒后执行 `esp_restart()`。
+`reason` 可选且最多 255 个 UTF-8 字节。固件收到后先持久化并返回
+command-result，1 秒后执行 `esp_restart()`。
 
 **BLOCK_TRAFFIC** — 安装目标 IP 与可选 hostname 的流量阻断规则
 
@@ -226,6 +227,11 @@ Topic: `cmd/stage-wifi-config`
 ```
 
 `requestId`、`deviceCode`、`ssid`、`password` 和 `configVersion` 均为必填字段。SSID 为 1-32 字节；开放网络密码为空，否则密码为 8-63 字节；`configVersion` 范围为 1-4294967295。完整协议边界与后端对照见 `docs/firmware-contract-audit.md`。
+
+后端发送的六类生产命令都携带非空 `requestId`。固件在 NVS 中保存最近
+16 条命令终态；QoS 1 重投、MQTT 重连或 KICK 重启后再次收到相同
+`requestId` 时不会重复执行，只会重发原 `command-result`。旧 payload
+除 `STAGE_WIFI_CONFIG` 外仍可不带 `requestId`，但不具备重复执行保护。
 
 ## 测试指南
 
@@ -274,7 +280,7 @@ mosquitto_pub -h 192.168.137.1 -p 1883 \
 ```bash
 mosquitto_pub -h 192.168.137.1 -p 1883 \
   -t "wifi/device/esp32-gateway-001/cmd/disconnect-mac" \
-  -m '{"mac":"22:CF:F6:0A:25:CC","alertId":2001}' -q 1
+  -m '{"requestId":"disconnect-test-1","mac":"22:CF:F6:0A:25:CC","alertId":2001}' -q 1
 ```
 
 手机 WiFi 断开后自动重连，状态重置为 UNAUTHORIZED。
@@ -284,7 +290,7 @@ mosquitto_pub -h 192.168.137.1 -p 1883 \
 ```bash
 mosquitto_pub -h 192.168.137.1 -p 1883 \
   -t "wifi/device/esp32-gateway-001/cmd/kick" \
-  -m '{"deviceCode":"esp32-gateway-001","reason":"manual test"}' -q 1
+  -m '{"requestId":"kick-test-1","deviceCode":"esp32-gateway-001","reason":"manual test"}' -q 1
 ```
 
 `command-result` 返回 `"type":"KICK","success":true`，ESP32 在 1 秒后重启。

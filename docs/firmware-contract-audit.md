@@ -34,15 +34,17 @@ The backend treats the topic device code as the trusted identity and rejects a c
 
 ## Command payload rules
 
-- Shared `requestId`: optional for the legacy commands, maximum 63 visible bytes. It is required and non-empty for `STAGE_WIFI_CONFIG`.
+- Shared `requestId`: all backend production payloads include a non-empty value with at most 63 visible bytes. Legacy payloads without it remain parseable except for `STAGE_WIFI_CONFIG`, but cannot receive duplicate-execution protection.
 - `ALLOW`: requires `mac`, positive `sessionId`, and `ttlSeconds` in 1..86400.
 - `REVOKE_ACCESS`: requires `mac` and positive `sessionId`.
 - `DISCONNECT_MAC`: requires `mac` and `alertId >= 0`.
-- `KICK`: requires `deviceCode`; `reason` is optional in the backend contract.
+- `KICK`: requires `deviceCode`; `reason` is optional and allows at most 255 UTF-8 bytes.
 - `BLOCK_TRAFFIC`: requires `alertId >= 0` and `dstIp`; `sni` is optional. Firmware buffers allow 45 visible bytes for `dstIp` and 255 for `sni`.
 - `STAGE_WIFI_CONFIG`: requires non-empty `requestId`, `deviceCode`, and `ssid`, plus `password` and integral `configVersion` in 1..4294967295. SSID is 1..32 bytes. Password is empty for an open network or 8..63 bytes.
 
 Firmware command result fields are `deviceCode`, `requestId`, `type`, `success`, and `message`. The result message buffer allows 95 visible bytes.
+
+The firmware stores the latest 16 terminal production-command results in a dedicated NVS namespace. A repeated `requestId` never executes the command again; the firmware republishes the original terminal result after QoS 1 redelivery, MQTT reconnect, or a KICK restart. A KICK is cancelled if its successful terminal result cannot be persisted before restart.
 
 ## Portal configuration
 
@@ -56,5 +58,4 @@ The client device must resolve `portal.test` to that IPv4 address. Production de
 
 ## Deferred protocol debt
 
-- P-3B: the firmware currently stores the KICK reason through the command request MAC buffer. The wire payload remains compatible, but the internal field ownership is misleading and length-limited. Correct it only in the planned P-3B protocol stage.
 - `PING` and `GET_STATUS` exist as internal command types, but the current topic parser accepts only the six production command topics listed above. Do not advertise them as externally supported until both publisher and parser contracts are implemented.

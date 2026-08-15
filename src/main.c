@@ -24,6 +24,7 @@
 
 static void handle_mqtt_command(const char *topic, int topic_len, const char *payload, int payload_len);
 static esp_err_t publish_command_result(const app_command_result_t *result);
+static esp_err_t save_and_publish_command_result(const app_command_result_t *result);
 static esp_err_t handle_wifi_provisioning(const char *ssid, const char *password);
 
 // 主题事件状态上发
@@ -504,6 +505,34 @@ static esp_err_t publish_command_result(const app_command_result_t *result)
     return app_mqtt_publish(DEVICE_COMMAND_RESULT_TOPIC, result_buffer);
 }
 
+static bool is_production_command(app_command_type_t type)
+{
+    return type >= APP_COMMAND_TYPE_ALLOW &&
+           type <= APP_COMMAND_TYPE_STAGE_WIFI_CONFIG;
+}
+
+static esp_err_t save_and_publish_command_result(
+    const app_command_result_t *result)
+{
+    if (result != NULL &&
+        result->request_id[0] != '\0' &&
+        is_production_command(result->type))
+    {
+        esp_err_t cache_err =
+            app_storage_save_command_result(result);
+        if (cache_err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "Save command result cache failed, type=%s, err=%s",
+                app_command_type_to_string(result->type),
+                esp_err_to_name(cache_err));
+        }
+    }
+
+    return publish_command_result(result);
+}
+
 static void handle_mqtt_command(const char *topic, int topic_len, const char *payload, int payload_len)
 { 
     ESP_LOGI(TAG, "Command handler called, topic: %.*s, payload_len=%d",
@@ -521,6 +550,46 @@ static void handle_mqtt_command(const char *topic, int topic_len, const char *pa
     result.type = request.type;
     result.success = false;
 
+    if (request.request_id[0] != '\0' &&
+        is_production_command(request.type))
+    {
+        app_command_result_t cached_result = {0};
+        esp_err_t cache_err = app_storage_load_command_result(
+            request.request_id,
+            &cached_result);
+        if (cache_err == ESP_OK)
+        {
+            ESP_LOGI(
+                TAG,
+                "Duplicate command replayed from cache, type=%s",
+                app_command_type_to_string(cached_result.type));
+            esp_err_t publish_err =
+                publish_command_result(&cached_result);
+            if (publish_err != ESP_OK)
+            {
+                ESP_LOGE(
+                    TAG,
+                    "Publish cached command result failed: %s",
+                    esp_err_to_name(publish_err));
+            }
+            return;
+        }
+        if (cache_err != ESP_ERR_NOT_FOUND)
+        {
+            snprintf(
+                result.message,
+                sizeof(result.message),
+                "%s",
+                "command result cache unavailable");
+            ESP_LOGE(
+                TAG,
+                "Read command result cache failed: %s",
+                esp_err_to_name(cache_err));
+            publish_command_result(&result);
+            return;
+        }
+    }
+
     // 解析失败不代表可以直接结束
     // 仍然需要发布失败结果，让后端知道命令没有被执行
     if (err != ESP_OK)
@@ -529,7 +598,7 @@ static void handle_mqtt_command(const char *topic, int topic_len, const char *pa
 
         ESP_LOGE(TAG,"Parse command failed: %s",esp_err_to_name(err));
 
-        esp_err_t publish_err = publish_command_result(&result);
+        esp_err_t publish_err = save_and_publish_command_result(&result);
         if (publish_err != ESP_OK)
         {
             ESP_LOGE(TAG,"Publish parse failure result failed: %s",esp_err_to_name(publish_err));
@@ -643,10 +712,30 @@ static void handle_mqtt_command(const char *topic, int topic_len, const char *pa
     {
         // KICK 是节点级安全应急复位命令
         // 先发布 command-result 告知后端已收到，再执行设备重启
-        ESP_LOGW(TAG, "KICK command received, reason=%s, restarting device", request.mac);
+        ESP_LOGW(
+            TAG,
+            "KICK command received, reason_len=%u, restarting device",
+            (unsigned)strlen(request.reason));
 
         result.success = true;
         snprintf(result.message, sizeof(result.message), "%s", "device restarting");
+
+        esp_err_t cache_err = app_storage_save_command_result(&result);
+        if (cache_err != ESP_OK)
+        {
+            result.success = false;
+            snprintf(
+                result.message,
+                sizeof(result.message),
+                "%s",
+                "command result cache unavailable");
+            ESP_LOGE(
+                TAG,
+                "KICK cancelled because result cache failed: %s",
+                esp_err_to_name(cache_err));
+            publish_command_result(&result);
+            return;
+        }
 
         esp_err_t kick_err = publish_command_result(&result);
         if (kick_err != ESP_OK)
@@ -730,7 +819,7 @@ static void handle_mqtt_command(const char *topic, int topic_len, const char *pa
         return;
     }
 
-    err = publish_command_result(&result);
+    err = save_and_publish_command_result(&result);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Publish command result failed: %s", esp_err_to_name(err));
