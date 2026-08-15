@@ -1,0 +1,81 @@
+{
+  "version": "mqtt-protocol-v1",
+  "samples": [
+    {
+      "name": "MISSING_REQUIRED_FIELD",
+      "topic": "wifi/device/esp32-gateway-001/cmd/stage-wifi-config",
+      "payload": {
+        "deviceCode": "esp32-gateway-001",
+        "ssid": "FixtureWifi",
+        "password": "invalid-test-password",
+        "configVersion": 7
+      },
+      "expected": "REJECT"
+    },
+    {
+      "name": "WRONG_FIELD_TYPE",
+      "topic": "wifi/device/esp32-gateway-001/cmd/allow",
+      "payload": {
+        "requestId": "req-wrong-type-v1",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "sessionId": 42,
+        "ttlSeconds": "60"
+      },
+      "expected": "REJECT"
+    },
+    {
+      "name": "OVERLONG_FIELD",
+      "topic": "wifi/device/esp32-gateway-001/cmd/allow",
+      "payload": {
+        "requestId": "1234567890123456789012345678901234567890123456789012345678901234",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "sessionId": 42,
+        "ttlSeconds": 60
+      },
+      "expected": "REJECT"
+    },
+    {
+      "name": "UNKNOWN_ENUM",
+      "topic": "wifi/device/esp32-gateway-001/cmd/not-supported",
+      "payload": {
+        "requestId": "req-unknown-v1"
+      },
+      "expected": "REJECT"
+    },
+    {
+      "name": "DUPLICATE_REQUEST_ID",
+      "topic": "wifi/device/esp32-gateway-001/cmd/allow",
+      "payload": {
+        "requestId": "req-duplicate-v1",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "sessionId": 42,
+        "ttlSeconds": 60
+      },
+      "repeatCount": 2,
+      "expected": "REPLAY_IMMUTABLE_TERMINAL_RESULT"
+    },
+    {
+      "name": "STALE_CONFIG_VERSION",
+      "topic": "wifi/device/esp32-gateway-001/cmd/stage-wifi-config",
+      "payload": {
+        "requestId": "req-wifi-stale-v1",
+        "deviceCode": "esp32-gateway-001",
+        "ssid": "FixtureWifi",
+        "password": "invalid-test-password",
+        "configVersion": 6
+      },
+      "existingConfigVersion": 7,
+      "expected": "REJECT_WITHOUT_CHANGING_SLOTS"
+    },
+    {
+      "name": "TOPIC_PAYLOAD_DEVICE_MISMATCH",
+      "topic": "wifi/device/esp32-gateway-001/cmd/kick",
+      "payload": {
+        "requestId": "req-mismatch-v1",
+        "deviceCode": "esp32-gateway-002",
+        "reason": "fixed test reason"
+      },
+      "expected": "REJECT"
+    }
+  ]
+}

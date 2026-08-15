@@ -1,0 +1,182 @@
+{
+  "$id": "wifi-manager://contracts/mqtt-protocol-v1",
+  "version": "mqtt-protocol-v1",
+  "topicPrefix": "wifi/device/{deviceCode}",
+  "qos": 1,
+  "retained": false,
+  "requestId": {
+    "producerRequired": true,
+    "maximumVisibleBytes": 63,
+    "legacyConsumerOptionalExcept": [
+      "STAGE_WIFI_CONFIG"
+    ]
+  },
+  "commands": [
+    {
+      "name": "ALLOW",
+      "topicSuffix": "/cmd/allow",
+      "required": ["requestId", "mac", "sessionId", "ttlSeconds"],
+      "sample": {
+        "requestId": "req-allow-v1",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "sessionId": 42,
+        "ttlSeconds": 60
+      }
+    },
+    {
+      "name": "REVOKE_ACCESS",
+      "topicSuffix": "/cmd/revoke-access",
+      "required": ["requestId", "mac", "sessionId"],
+      "sample": {
+        "requestId": "req-revoke-v1",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "sessionId": 42
+      }
+    },
+    {
+      "name": "KICK",
+      "topicSuffix": "/cmd/kick",
+      "required": ["requestId", "deviceCode"],
+      "optional": ["reason"],
+      "sample": {
+        "requestId": "req-kick-v1",
+        "deviceCode": "esp32-gateway-001",
+        "reason": "fixed test reason"
+      }
+    },
+    {
+      "name": "DISCONNECT_MAC",
+      "topicSuffix": "/cmd/disconnect-mac",
+      "required": ["requestId", "mac", "alertId"],
+      "sample": {
+        "requestId": "req-disconnect-v1",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "alertId": 0
+      }
+    },
+    {
+      "name": "BLOCK_TRAFFIC",
+      "topicSuffix": "/cmd/block-traffic",
+      "required": ["requestId", "dstIp", "alertId"],
+      "optional": ["sni"],
+      "sample": {
+        "requestId": "req-block-v1",
+        "dstIp": "203.0.113.10",
+        "sni": "blocked.test",
+        "alertId": 0
+      }
+    },
+    {
+      "name": "STAGE_WIFI_CONFIG",
+      "topicSuffix": "/cmd/stage-wifi-config",
+      "required": ["requestId", "deviceCode", "ssid", "password", "configVersion"],
+      "sample": {
+        "requestId": "req-wifi-v1",
+        "deviceCode": "esp32-gateway-001",
+        "ssid": "FixtureWifi",
+        "password": "invalid-test-password",
+        "configVersion": 7
+      }
+    }
+  ],
+  "events": [
+    {
+      "name": "STATUS",
+      "topicSuffix": "/event/status",
+      "implementation": "FIRMWARE_PRODUCER_WITH_BACKEND_PARTIAL_CONSUMER",
+      "sample": {
+        "deviceCode": "esp32-gateway-001",
+        "status": 1,
+        "rssi": -48,
+        "wifiStatus": "STA_GOT_IP",
+        "ip": "192.0.2.10",
+        "currentClients": 1,
+        "firmwareVersion": "0.1.4",
+        "activeWifiConfigRequestId": "req-wifi-v1",
+        "activeWifiConfigVersion": 7,
+        "pendingWifiConfigRequestId": "",
+        "pendingWifiConfigVersion": 0
+      }
+    },
+    {
+      "name": "TRAFFIC",
+      "topicSuffix": "/event/traffic",
+      "implementation": "BACKEND_CONSUMER_ONLY",
+      "sample": {
+        "eventId": "evt-traffic-v1",
+        "deviceCode": "esp32-gateway-001",
+        "sessionId": 42,
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "dstIp": "203.0.113.10",
+        "dstPort": 443,
+        "sni": "example.test",
+        "protocol": "TCP",
+        "bytesUp": 128,
+        "bytesDown": 512
+      }
+    },
+    {
+      "name": "CLIENT_SIGNAL",
+      "topicSuffix": "/event/client-signal",
+      "implementation": "BOTH",
+      "sample": {
+        "deviceCode": "esp32-gateway-001",
+        "clients": [
+          {
+            "mac": "AA:BB:CC:DD:EE:FF",
+            "sessionId": 42,
+            "rssi": -55,
+            "state": "AUTHORIZED"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CLIENT_DISCONNECT",
+      "topicSuffix": "/event/client-disconnect",
+      "implementation": "BOTH",
+      "sample": {
+        "deviceCode": "esp32-gateway-001",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "sessionId": 42,
+        "state": "AUTHORIZED"
+      }
+    },
+    {
+      "name": "COMMAND_RESULT",
+      "topicSuffix": "/event/command-result",
+      "implementation": "BOTH",
+      "terminalTypes": [
+        "ALLOW",
+        "REVOKE_ACCESS",
+        "KICK",
+        "DISCONNECT_MAC",
+        "BLOCK_TRAFFIC",
+        "STAGE_WIFI_CONFIG"
+      ],
+      "successSample": {
+        "deviceCode": "esp32-gateway-001",
+        "requestId": "req-allow-v1",
+        "type": "ALLOW",
+        "success": true,
+        "message": "allowed"
+      },
+      "failureSample": {
+        "deviceCode": "esp32-gateway-001",
+        "requestId": "req-allow-v1",
+        "type": "ALLOW",
+        "success": false,
+        "message": "invalid command payload"
+      }
+    }
+  ],
+  "negativeSamples": [
+    "MISSING_REQUIRED_FIELD",
+    "WRONG_FIELD_TYPE",
+    "OVERLONG_FIELD",
+    "UNKNOWN_ENUM",
+    "DUPLICATE_REQUEST_ID",
+    "STALE_CONFIG_VERSION",
+    "TOPIC_PAYLOAD_DEVICE_MISMATCH"
+  ]
+}

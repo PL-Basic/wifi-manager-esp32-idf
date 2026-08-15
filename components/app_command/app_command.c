@@ -90,6 +90,84 @@ static esp_err_t read_command_type_from_topic(const char *topic, int topic_len, 
     return ESP_ERR_NOT_FOUND;
 }
 
+static esp_err_t read_device_code_from_topic(
+    const char *topic,
+    int topic_len,
+    char *device_code,
+    size_t device_code_size)
+{
+    static const char topic_prefix[] = "wifi/device/";
+    static const char command_marker[] = "/cmd/";
+
+    if (topic == NULL || topic_len <= 0 ||
+        device_code == NULL || device_code_size == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    device_code[0] = '\0';
+    if (topic_len >= COMMAND_TOPIC_BUFFER_SIZE)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char topic_buffer[COMMAND_TOPIC_BUFFER_SIZE] = {0};
+    memcpy(topic_buffer, topic, topic_len);
+    topic_buffer[topic_len] = '\0';
+
+    size_t prefix_length = strlen(topic_prefix);
+    if (strncmp(topic_buffer, topic_prefix, prefix_length) != 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *device_start = topic_buffer + prefix_length;
+    const char *marker = strstr(device_start, command_marker);
+    if (marker == NULL || marker == device_start ||
+        strchr(device_start, '/') != marker ||
+        marker[strlen(command_marker)] == '\0' ||
+        strchr(marker + strlen(command_marker), '/') != NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t device_length = (size_t)(marker - device_start);
+    if (device_length >= device_code_size)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    memcpy(device_code, device_start, device_length);
+    device_code[device_length] = '\0';
+    return ESP_OK;
+}
+
+static esp_err_t validate_topic_payload_device(
+    const char *topic,
+    int topic_len,
+    const char *payload_device_code)
+{
+    if (payload_device_code == NULL || payload_device_code[0] == '\0')
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char topic_device_code[APP_COMMAND_DEVICE_CODE_SIZE] = {0};
+    esp_err_t err = read_device_code_from_topic(
+        topic,
+        topic_len,
+        topic_device_code,
+        sizeof(topic_device_code));
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    return strcmp(topic_device_code, payload_device_code) == 0
+        ? ESP_OK
+        : ESP_ERR_INVALID_ARG;
+}
+
 // 从 JSON 字符串里取指定字段（out = id）
 static esp_err_t read_json_string_field(const char *json, const char *key, char *out, size_t out_size)
 {
@@ -287,7 +365,7 @@ static esp_err_t parse_stage_wifi_config_payload(
     return err;
 }
 
-static esp_err_t parse_kick_reason(
+static esp_err_t parse_kick_payload(
     const char *payload,
     app_command_request_t *request)
 {
@@ -299,9 +377,15 @@ static esp_err_t parse_kick_reason(
         return ESP_ERR_INVALID_ARG;
     }
 
+    esp_err_t err = copy_required_json_string(
+        root,
+        "deviceCode",
+        request->device_code,
+        sizeof(request->device_code),
+        false);
+
     const cJSON *reason = cJSON_GetObjectItemCaseSensitive(root, "reason");
-    esp_err_t err = ESP_OK;
-    if (reason != NULL)
+    if (err == ESP_OK && reason != NULL)
     {
         if (!cJSON_IsString(reason) || reason->valuestring == NULL)
         {
@@ -390,7 +474,15 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
     if (topic_err == ESP_OK && topic_command_type == APP_COMMAND_TYPE_STAGE_WIFI_CONFIG)
     {
         request->type = APP_COMMAND_TYPE_STAGE_WIFI_CONFIG;
-        return parse_stage_wifi_config_payload(payload_buffer, request);
+        esp_err_t err = parse_stage_wifi_config_payload(payload_buffer, request);
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+        return validate_topic_payload_device(
+            topic,
+            topic_len,
+            request->device_code);
     }
 
     // 先尝试读取 requestId。
@@ -512,10 +604,20 @@ esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,
         {
             // 后端 payload 格式：{"deviceCode":"...","reason":"..."}
             // reason 字段可选，缺失时不报错，仅记录为空
-            err = parse_kick_reason(payload_buffer, request);
+            err = parse_kick_payload(payload_buffer, request);
             if (err != ESP_OK)
             {
-                ESP_LOGE(TAG, "Read KICK reason failed: %s", esp_err_to_name(err));
+                ESP_LOGE(TAG, "Read KICK payload failed: %s", esp_err_to_name(err));
+                return err;
+            }
+
+            err = validate_topic_payload_device(
+                topic,
+                topic_len,
+                request->device_code);
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "KICK topic device mismatch");
                 return err;
             }
 
