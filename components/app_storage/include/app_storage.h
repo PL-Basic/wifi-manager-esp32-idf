@@ -44,6 +44,14 @@ typedef enum
     APP_STORAGE_WIFI_STAGE_VERSION_CONFLICT,
 } app_storage_wifi_stage_result_t;
 
+typedef enum
+{
+    APP_STORAGE_COMMAND_CLAIMED = 0,
+    APP_STORAGE_COMMAND_REPLAY,
+    APP_STORAGE_COMMAND_TYPE_CONFLICT,
+    APP_STORAGE_COMMAND_INTERRUPTED,
+} app_storage_command_claim_result_t;
+
 // 初始化nvs
 esp_err_t app_storage_init_nvs(void);
 
@@ -77,6 +85,17 @@ esp_err_t app_storage_load_wifi_config_status(app_storage_wifi_config_status_t *
 esp_err_t app_storage_load_command_result(
     const char *request_id,
     app_command_result_t *result);
+
+// 在执行副作用前持久化命令身份；重复命令只返回既有状态，不重新执行。
+esp_err_t app_storage_claim_command(
+    const char *request_id,
+    app_command_type_t type,
+    app_storage_command_claim_result_t *claim_result,
+    app_command_result_t *replay_result);
+
+// 将已 claim 的命令更新为不可变终态；不存在 claim 时拒绝写入。
+esp_err_t app_storage_complete_command_result(
+    const app_command_result_t *result);
 
 // 保存最近生产命令的终态；相同 requestId 首次结果保持不变。
 esp_err_t app_storage_save_command_result(

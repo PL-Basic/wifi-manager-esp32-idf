@@ -6,5 +6,5 @@ FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/*.*)
 idf_component_register(
     SRCS ${app_sources}
     INCLUDE_DIRS "../include"
-    REQUIRES app_storage wifi_gateway device_status app_mqtt app_command client_access access_filter captive_portal tls_sni_parser espressif__cjson
+    REQUIRES app_storage wifi_gateway device_status app_mqtt app_command app_command_coordinator client_access access_filter captive_portal tls_sni_parser espressif__cjson
 )

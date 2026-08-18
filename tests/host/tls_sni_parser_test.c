@@ -1,11 +1,25 @@
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "tls_sni_parser.h"
-#include "unity.h"
+
+#define CHECK(condition)                                                     \
+    do                                                                       \
+    {                                                                        \
+        if (!(condition))                                                    \
+        {                                                                    \
+            fprintf(                                                         \
+                stderr,                                                      \
+                "%s:%d: check failed: %s\n",                                 \
+                __FILE__,                                                    \
+                __LINE__,                                                    \
+                #condition);                                                 \
+            return false;                                                    \
+        }                                                                    \
+    } while (0)
 
 static void write_u16(uint8_t *buffer, size_t *offset, uint16_t value)
 {
@@ -13,15 +27,15 @@ static void write_u16(uint8_t *buffer, size_t *offset, uint16_t value)
     buffer[(*offset)++] = (uint8_t)value;
 }
 
-static void build_client_hello(
+static bool build_client_hello(
     uint8_t *buffer,
     size_t buffer_size,
     const char *hostname,
     size_t *hello_length)
 {
-    TEST_ASSERT_NOT_NULL(buffer);
-    TEST_ASSERT_NOT_NULL(hello_length);
-    TEST_ASSERT_TRUE(buffer_size >= 128);
+    CHECK(buffer != NULL);
+    CHECK(hello_length != NULL);
+    CHECK(buffer_size >= 128);
 
     size_t offset = 5;
     size_t handshake_start = offset;
@@ -45,8 +59,8 @@ static void build_client_hello(
     if (hostname != NULL)
     {
         size_t hostname_length = strlen(hostname);
-        TEST_ASSERT_TRUE(hostname_length > 0);
-        TEST_ASSERT_TRUE(hostname_length < 64);
+        CHECK(hostname_length > 0);
+        CHECK(hostname_length < 64);
 
         write_u16(buffer, &offset, 0);
         size_t extension_length_offset = offset;
@@ -86,73 +100,67 @@ static void build_client_hello(
     buffer[3] = (uint8_t)(handshake_length >> 8);
     buffer[4] = (uint8_t)handshake_length;
     *hello_length = offset;
+    return true;
 }
 
-void setUp(void)
-{
-}
-
-void tearDown(void)
-{
-}
-
-static void test_fragmented_client_hello_finds_normalized_sni(void)
+static bool fragmented_client_hello_finds_normalized_sni(void)
 {
     uint8_t hello[128] = {0};
     size_t hello_length = 0;
-    build_client_hello(
+    CHECK(build_client_hello(
         hello,
         sizeof(hello),
         "Portal.TEST",
-        &hello_length);
+        &hello_length));
+
     tls_sni_parser_t parser;
     char hostname[TLS_SNI_HOSTNAME_SIZE] = {0};
 
     tls_sni_parser_init(&parser);
-    TEST_ASSERT_EQUAL(
-        TLS_SNI_PARSE_NEED_MORE,
+    CHECK(
         tls_sni_parser_feed(
             &parser,
             hello,
             7,
             hostname,
-            sizeof(hostname)));
-    TEST_ASSERT_EQUAL(
-        TLS_SNI_PARSE_FOUND,
+            sizeof(hostname)) == TLS_SNI_PARSE_NEED_MORE);
+    CHECK(
         tls_sni_parser_feed(
             &parser,
             hello + 7,
             hello_length - 7,
             hostname,
-            sizeof(hostname)));
-    TEST_ASSERT_EQUAL_STRING("portal.test", hostname);
+            sizeof(hostname)) == TLS_SNI_PARSE_FOUND);
+    CHECK(strcmp(hostname, "portal.test") == 0);
+    return true;
 }
 
-static void test_client_hello_without_sni_is_explicit(void)
+static bool client_hello_without_sni_is_explicit(void)
 {
     uint8_t hello[128] = {0};
     size_t hello_length = 0;
-    build_client_hello(
+    CHECK(build_client_hello(
         hello,
         sizeof(hello),
         NULL,
-        &hello_length);
+        &hello_length));
+
     tls_sni_parser_t parser;
     char hostname[TLS_SNI_HOSTNAME_SIZE] = {0};
 
     tls_sni_parser_init(&parser);
-    TEST_ASSERT_EQUAL(
-        TLS_SNI_PARSE_NO_SNI,
+    CHECK(
         tls_sni_parser_feed(
             &parser,
             hello,
             hello_length,
             hostname,
-            sizeof(hostname)));
-    TEST_ASSERT_EQUAL_STRING("", hostname);
+            sizeof(hostname)) == TLS_SNI_PARSE_NO_SNI);
+    CHECK(strcmp(hostname, "") == 0);
+    return true;
 }
 
-static void test_non_handshake_record_is_rejected(void)
+static bool non_handshake_record_is_rejected(void)
 {
     const uint8_t record[] = {
         23, 0x03, 0x03, 0x00, 0x01, 0x00
@@ -161,23 +169,54 @@ static void test_non_handshake_record_is_rejected(void)
     char hostname[TLS_SNI_HOSTNAME_SIZE] = {0};
 
     tls_sni_parser_init(&parser);
-    TEST_ASSERT_EQUAL(
-        TLS_SNI_PARSE_INVALID,
+    CHECK(
         tls_sni_parser_feed(
             &parser,
             record,
             sizeof(record),
             hostname,
-            sizeof(hostname)));
+            sizeof(hostname)) == TLS_SNI_PARSE_INVALID);
+    return true;
 }
 
-void app_main(void)
+int main(void)
 {
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    static const struct
+    {
+        const char *name;
+        bool (*run)(void);
+    } tests[] = {
+        {
+            "fragmented_client_hello_finds_normalized_sni",
+            fragmented_client_hello_finds_normalized_sni
+        },
+        {
+            "client_hello_without_sni_is_explicit",
+            client_hello_without_sni_is_explicit
+        },
+        {
+            "non_handshake_record_is_rejected",
+            non_handshake_record_is_rejected
+        }
+    };
 
-    UNITY_BEGIN();
-    RUN_TEST(test_fragmented_client_hello_finds_normalized_sni);
-    RUN_TEST(test_client_hello_without_sni_is_explicit);
-    RUN_TEST(test_non_handshake_record_is_rejected);
-    UNITY_END();
+    size_t failed = 0;
+    for (size_t index = 0; index < sizeof(tests) / sizeof(tests[0]); index++)
+    {
+        if (tests[index].run())
+        {
+            printf("[PASS] %s\n", tests[index].name);
+        }
+        else
+        {
+            fprintf(stderr, "[FAIL] %s\n", tests[index].name);
+            failed++;
+        }
+    }
+
+    printf(
+        "%zu tests, %zu failures\n",
+        sizeof(tests) / sizeof(tests[0]),
+        failed);
+    return failed == 0 ? 0 : 1;
 }

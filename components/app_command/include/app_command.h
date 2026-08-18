@@ -43,6 +43,14 @@ typedef enum
     APP_COMMAND_TYPE_GET_STATUS
 } app_command_type_t;
 
+// 生产命令在业务字段校验前即可识别并持久化的不可变身份。
+typedef struct
+{
+    char request_id[APP_COMMAND_REQUEST_ID_SIZE];
+    app_command_type_t type;
+    char device_code[APP_COMMAND_DEVICE_CODE_SIZE];
+} app_command_envelope_t;
+
 // 保存从 MQTT topic 和 payload 解析出的命令输入
 typedef struct
 {
@@ -58,8 +66,9 @@ typedef struct
     char dst_ip[APP_COMMAND_DESTINATION_IP_SIZE];
     // BLOCK_TRAFFIC 的可选规范化域名阻断目标。
     char sni[APP_COMMAND_SNI_SIZE];
-    // STAGE_WIFI_CONFIG 的目标设备与双槽候选配置。
+    // topic 中的目标设备；KICK/STAGE 还要求 payload 中的设备与其一致。
     char device_code[APP_COMMAND_DEVICE_CODE_SIZE];
+    // STAGE_WIFI_CONFIG 的双槽候选配置。
     char wifi_ssid[APP_COMMAND_WIFI_SSID_SIZE];
     char wifi_password[APP_COMMAND_WIFI_PASSWORD_SIZE];
     uint32_t wifi_config_version;
@@ -89,6 +98,23 @@ typedef struct
 
 // 把内部命令枚举转换成 MQTT JSON 需要的字符串
 const char *app_command_type_to_string(app_command_type_t type);
+// 校验命令是否确实发往当前固件身份。
+bool app_command_targets_device(
+    const app_command_request_t *request,
+    const char *local_device_code);
+// 只提取生产 topic 和 requestId 身份，不校验业务 payload 字段。
+esp_err_t app_command_parse_production_envelope(
+    const char *topic,
+    int topic_len,
+    const char *payload,
+    int payload_len,
+    app_command_envelope_t *envelope);
+// 在已冻结 envelope 上解析并校验生产命令业务字段。
+esp_err_t app_command_parse_production_payload(
+    const char *payload,
+    int payload_len,
+    const app_command_envelope_t *envelope,
+    app_command_request_t *request);
 // 下派任务处理函数
 esp_err_t app_command_parse(const char *topic,int topic_len,const char *payload,int payload_len, app_command_request_t *request);
 

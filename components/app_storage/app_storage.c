@@ -28,9 +28,33 @@
 #define APP_STORAGE_COMMAND_RESULT_NEXT_KEY "next"
 #define APP_STORAGE_COMMAND_RESULT_CACHE_SIZE 16
 #define APP_STORAGE_COMMAND_RESULT_RECORD_VERSION 1
+#define APP_STORAGE_COMMAND_PENDING_RECORD_VERSION 2
+
+#ifdef APP_STORAGE_NVS_PARTITION
+#define APP_STORAGE_STRINGIFY_VALUE(value) #value
+#define APP_STORAGE_STRINGIFY(value) APP_STORAGE_STRINGIFY_VALUE(value)
+#define APP_STORAGE_NVS_PARTITION_NAME \
+    APP_STORAGE_STRINGIFY(APP_STORAGE_NVS_PARTITION)
+#endif
 
 static const char *TAG = "app_storage";
 static SemaphoreHandle_t s_wifi_config_mutex = NULL;
+
+static esp_err_t app_storage_open(
+    const char *namespace_name,
+    nvs_open_mode_t open_mode,
+    nvs_handle_t *handle)
+{
+#ifdef APP_STORAGE_NVS_PARTITION
+    return nvs_open_from_partition(
+        APP_STORAGE_NVS_PARTITION_NAME,
+        namespace_name,
+        open_mode,
+        handle);
+#else
+    return nvs_open(namespace_name, open_mode, handle);
+#endif
+}
 
 typedef struct
 {
@@ -119,6 +143,63 @@ static bool command_result_record_is_valid(
            message_length < sizeof(record->message);
 }
 
+static bool command_result_record_has_identity(
+    const app_storage_command_result_record_t *record)
+{
+    if (record == NULL ||
+        (record->version != APP_STORAGE_COMMAND_RESULT_RECORD_VERSION &&
+         record->version != APP_STORAGE_COMMAND_PENDING_RECORD_VERSION) ||
+        record->type < (uint32_t)APP_COMMAND_TYPE_ALLOW ||
+        record->type > (uint32_t)APP_COMMAND_TYPE_STAGE_WIFI_CONFIG)
+    {
+        return false;
+    }
+
+    size_t request_id_length =
+        strnlen(record->request_id, sizeof(record->request_id));
+    return request_id_length > 0 &&
+           request_id_length < sizeof(record->request_id);
+}
+
+static void command_result_from_record(
+    const app_storage_command_result_record_t *record,
+    app_command_result_t *result)
+{
+    memset(result, 0, sizeof(*result));
+    snprintf(
+        result->request_id,
+        sizeof(result->request_id),
+        "%s",
+        record->request_id);
+    result->type = (app_command_type_t)record->type;
+    result->success = record->success != 0;
+    snprintf(
+        result->message,
+        sizeof(result->message),
+        "%s",
+        record->message);
+}
+
+static app_storage_command_result_record_t command_result_record(
+    const app_command_result_t *result)
+{
+    app_storage_command_result_record_t record = {0};
+    record.version = APP_STORAGE_COMMAND_RESULT_RECORD_VERSION;
+    snprintf(
+        record.request_id,
+        sizeof(record.request_id),
+        "%s",
+        result->request_id);
+    record.type = (uint32_t)result->type;
+    record.success = result->success ? 1 : 0;
+    snprintf(
+        record.message,
+        sizeof(record.message),
+        "%s",
+        result->message);
+    return record;
+}
+
 // 检查调用方提供的上游WiFi平局释放可以安全保存
 static esp_err_t validate_wifi_credentials(const app_storage_wifi_credentials_t *credentials)
 {
@@ -167,6 +248,56 @@ static esp_err_t validate_wifi_config(const app_storage_wifi_config_t *config)
     }
 
     return validate_wifi_credentials(&config->credentials);
+}
+
+static bool wifi_credentials_equal(
+    const app_storage_wifi_credentials_t *left,
+    const app_storage_wifi_credentials_t *right)
+{
+    return left != NULL &&
+           right != NULL &&
+           strcmp(left->ssid, right->ssid) == 0 &&
+           strcmp(left->password, right->password) == 0;
+}
+
+static esp_err_t load_wifi_credentials_from_handle(
+    nvs_handle_t handle,
+    app_storage_wifi_credentials_t *credentials)
+{
+    if (credentials == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(credentials, 0, sizeof(*credentials));
+    size_t ssid_size = sizeof(credentials->ssid);
+    size_t password_size = sizeof(credentials->password);
+    esp_err_t err = nvs_get_str(
+        handle,
+        APP_STORAGE_WIFI_SSID_KEY,
+        credentials->ssid,
+        &ssid_size);
+    if (err == ESP_OK)
+    {
+        err = nvs_get_str(
+            handle,
+            APP_STORAGE_WIFI_PASSWORD_KEY,
+            credentials->password,
+            &password_size);
+    }
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        err = ESP_ERR_INVALID_STATE;
+    }
+    if (err == ESP_OK)
+    {
+        err = validate_wifi_credentials(credentials);
+    }
+    if (err != ESP_OK)
+    {
+        memset(credentials, 0, sizeof(*credentials));
+    }
+    return err;
 }
 
 static esp_err_t erase_key_if_present(nvs_handle_t handle, const char *key, bool *changed)
@@ -307,7 +438,7 @@ static esp_err_t load_metadata_pair(
 esp_err_t app_storage_increment_recovery_retry(void)
 {
     nvs_handle_t handle;
-    esp_err_t err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    esp_err_t err = app_storage_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK)
     {
         return err;
@@ -346,7 +477,7 @@ esp_err_t app_storage_increment_recovery_retry(void)
 uint8_t app_storage_get_recovery_retry_count(void)
 {
     nvs_handle_t handle;
-    esp_err_t err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
+    esp_err_t err = app_storage_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
     if (err != ESP_OK)
     {
         return 0;
@@ -382,7 +513,7 @@ esp_err_t app_storage_save_wifi_credentials(const app_storage_wifi_credentials_t
 
     // 以可读写模式打开wifi_config命名空间。
     // handle是后续读写这个命名空间时使用的操作句柄。
-    err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    err = app_storage_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
 
     if (err != ESP_OK)
     {
@@ -457,7 +588,7 @@ esp_err_t app_storage_load_wifi_credentials(app_storage_wifi_credentials_t * cre
     nvs_handle_t handle;
 
     // 读取时只需要NVS_READONLY权限
-    esp_err_t err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
+    esp_err_t err = app_storage_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
 
     if (err != ESP_OK)
     {
@@ -528,7 +659,7 @@ esp_err_t app_storage_load_candidate_wifi_config(app_storage_wifi_config_t *conf
     }
 
     nvs_handle_t handle;
-    err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
+    err = app_storage_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND)
     {
         unlock_wifi_config();
@@ -569,7 +700,7 @@ esp_err_t app_storage_stage_candidate_wifi_config(
     }
 
     nvs_handle_t handle;
-    err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    err = app_storage_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK)
     {
         unlock_wifi_config();
@@ -607,7 +738,11 @@ esp_err_t app_storage_stage_candidate_wifi_config(
         pending.config_version == config->config_version &&
         strcmp(pending.request_id, config->request_id) == 0)
     {
-        *stage_result = APP_STORAGE_WIFI_STAGE_IDEMPOTENT;
+        *stage_result = wifi_credentials_equal(
+                            &pending.credentials,
+                            &config->credentials)
+                            ? APP_STORAGE_WIFI_STAGE_IDEMPOTENT
+                            : APP_STORAGE_WIFI_STAGE_VERSION_CONFLICT;
         nvs_close(handle);
         unlock_wifi_config();
         return ESP_OK;
@@ -616,10 +751,21 @@ esp_err_t app_storage_stage_candidate_wifi_config(
         active_version == config->config_version &&
         strcmp(active_request_id, config->request_id) == 0)
     {
-        *stage_result = APP_STORAGE_WIFI_STAGE_IDEMPOTENT;
+        app_storage_wifi_credentials_t active_credentials = {0};
+        err = load_wifi_credentials_from_handle(
+            handle,
+            &active_credentials);
+        if (err == ESP_OK)
+        {
+            *stage_result = wifi_credentials_equal(
+                                &active_credentials,
+                                &config->credentials)
+                                ? APP_STORAGE_WIFI_STAGE_IDEMPOTENT
+                                : APP_STORAGE_WIFI_STAGE_VERSION_CONFLICT;
+        }
         nvs_close(handle);
         unlock_wifi_config();
-        return ESP_OK;
+        return err;
     }
 
     uint32_t highest_version = 0;
@@ -694,7 +840,7 @@ esp_err_t app_storage_promote_candidate_wifi_config(
     }
 
     nvs_handle_t handle;
-    err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    err = app_storage_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK)
     {
         unlock_wifi_config();
@@ -771,7 +917,7 @@ esp_err_t app_storage_load_wifi_config_status(app_storage_wifi_config_status_t *
     }
 
     nvs_handle_t handle;
-    err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
+    err = app_storage_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND)
     {
         unlock_wifi_config();
@@ -830,7 +976,7 @@ esp_err_t app_storage_load_command_result(
     }
 
     nvs_handle_t handle;
-    err = nvs_open(
+    err = app_storage_open(
         APP_STORAGE_COMMAND_RESULT_NAMESPACE,
         NVS_READONLY,
         &handle);
@@ -890,6 +1036,232 @@ esp_err_t app_storage_load_command_result(
     return err;
 }
 
+esp_err_t app_storage_claim_command(
+    const char *request_id,
+    app_command_type_t type,
+    app_storage_command_claim_result_t *claim_result,
+    app_command_result_t *replay_result)
+{
+    if (request_id == NULL ||
+        request_id[0] == '\0' ||
+        !is_production_command_type(type) ||
+        claim_result == NULL ||
+        replay_result == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t request_id_length =
+        strnlen(request_id, APP_COMMAND_REQUEST_ID_SIZE);
+    if (request_id_length >= APP_COMMAND_REQUEST_ID_SIZE)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *claim_result = APP_STORAGE_COMMAND_CLAIMED;
+    memset(replay_result, 0, sizeof(*replay_result));
+
+    esp_err_t err = lock_wifi_config();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    nvs_handle_t handle;
+    err = app_storage_open(
+        APP_STORAGE_COMMAND_RESULT_NAMESPACE,
+        NVS_READWRITE,
+        &handle);
+    if (err != ESP_OK)
+    {
+        unlock_wifi_config();
+        return err;
+    }
+
+    for (uint8_t slot = 0;
+         slot < APP_STORAGE_COMMAND_RESULT_CACHE_SIZE;
+         slot++)
+    {
+        app_storage_command_result_record_t existing = {0};
+        esp_err_t read_err =
+            load_command_result_record(handle, slot, &existing);
+        if (read_err == ESP_ERR_NVS_NOT_FOUND)
+        {
+            continue;
+        }
+        if (read_err != ESP_OK)
+        {
+            err = read_err;
+            break;
+        }
+        if (!command_result_record_has_identity(&existing) ||
+            strcmp(existing.request_id, request_id) != 0)
+        {
+            continue;
+        }
+
+        if (existing.type != (uint32_t)type)
+        {
+            *claim_result = APP_STORAGE_COMMAND_TYPE_CONFLICT;
+        }
+        else if (command_result_record_is_valid(&existing))
+        {
+            *claim_result = APP_STORAGE_COMMAND_REPLAY;
+            command_result_from_record(&existing, replay_result);
+        }
+        else
+        {
+            *claim_result = APP_STORAGE_COMMAND_INTERRUPTED;
+            snprintf(
+                replay_result->request_id,
+                sizeof(replay_result->request_id),
+                "%s",
+                existing.request_id);
+            replay_result->type = (app_command_type_t)existing.type;
+            replay_result->success = false;
+            snprintf(
+                replay_result->message,
+                sizeof(replay_result->message),
+                "%s",
+                "command execution interrupted");
+        }
+
+        nvs_close(handle);
+        unlock_wifi_config();
+        return ESP_OK;
+    }
+
+    uint8_t next_slot = 0;
+    if (err == ESP_OK)
+    {
+        esp_err_t next_err = nvs_get_u8(
+            handle,
+            APP_STORAGE_COMMAND_RESULT_NEXT_KEY,
+            &next_slot);
+        if (next_err == ESP_ERR_NVS_NOT_FOUND)
+        {
+            next_slot = 0;
+        }
+        else if (next_err != ESP_OK)
+        {
+            err = next_err;
+        }
+    }
+    if (next_slot >= APP_STORAGE_COMMAND_RESULT_CACHE_SIZE)
+    {
+        next_slot = 0;
+    }
+
+    app_storage_command_result_record_t pending = {0};
+    pending.version = APP_STORAGE_COMMAND_PENDING_RECORD_VERSION;
+    snprintf(
+        pending.request_id,
+        sizeof(pending.request_id),
+        "%s",
+        request_id);
+    pending.type = (uint32_t)type;
+
+    char key[16] = {0};
+    command_result_slot_key(next_slot, key, sizeof(key));
+    if (err == ESP_OK)
+    {
+        err = nvs_set_blob(handle, key, &pending, sizeof(pending));
+    }
+    if (err == ESP_OK)
+    {
+        uint8_t following_slot =
+            (uint8_t)((next_slot + 1) %
+                      APP_STORAGE_COMMAND_RESULT_CACHE_SIZE);
+        err = nvs_set_u8(
+            handle,
+            APP_STORAGE_COMMAND_RESULT_NEXT_KEY,
+            following_slot);
+    }
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+
+    nvs_close(handle);
+    unlock_wifi_config();
+    return err;
+}
+
+esp_err_t app_storage_complete_command_result(
+    const app_command_result_t *result)
+{
+    if (!command_result_is_valid(result))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = lock_wifi_config();
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    nvs_handle_t handle;
+    err = app_storage_open(
+        APP_STORAGE_COMMAND_RESULT_NAMESPACE,
+        NVS_READWRITE,
+        &handle);
+    if (err != ESP_OK)
+    {
+        unlock_wifi_config();
+        return err;
+    }
+
+    err = ESP_ERR_NOT_FOUND;
+    for (uint8_t slot = 0;
+         slot < APP_STORAGE_COMMAND_RESULT_CACHE_SIZE;
+         slot++)
+    {
+        app_storage_command_result_record_t existing = {0};
+        esp_err_t read_err =
+            load_command_result_record(handle, slot, &existing);
+        if (read_err == ESP_ERR_NVS_NOT_FOUND)
+        {
+            continue;
+        }
+        if (read_err != ESP_OK)
+        {
+            err = read_err;
+            break;
+        }
+        if (!command_result_record_has_identity(&existing) ||
+            strcmp(existing.request_id, result->request_id) != 0)
+        {
+            continue;
+        }
+        if (existing.type != (uint32_t)result->type)
+        {
+            err = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        if (command_result_record_is_valid(&existing))
+        {
+            err = ESP_OK;
+            break;
+        }
+
+        app_storage_command_result_record_t terminal =
+            command_result_record(result);
+        char key[16] = {0};
+        command_result_slot_key(slot, key, sizeof(key));
+        err = nvs_set_blob(handle, key, &terminal, sizeof(terminal));
+        if (err == ESP_OK)
+        {
+            err = nvs_commit(handle);
+        }
+        break;
+    }
+
+    nvs_close(handle);
+    unlock_wifi_config();
+    return err;
+}
+
 esp_err_t app_storage_save_command_result(
     const app_command_result_t *result)
 {
@@ -905,7 +1277,7 @@ esp_err_t app_storage_save_command_result(
     }
 
     nvs_handle_t handle;
-    err = nvs_open(
+    err = app_storage_open(
         APP_STORAGE_COMMAND_RESULT_NAMESPACE,
         NVS_READWRITE,
         &handle);
@@ -936,7 +1308,9 @@ esp_err_t app_storage_save_command_result(
         {
             nvs_close(handle);
             unlock_wifi_config();
-            return ESP_OK;
+            return existing.type == (uint32_t)result->type
+                       ? ESP_OK
+                       : ESP_ERR_INVALID_STATE;
         }
     }
 
@@ -961,20 +1335,8 @@ esp_err_t app_storage_save_command_result(
         next_slot = 0;
     }
 
-    app_storage_command_result_record_t record = {0};
-    record.version = APP_STORAGE_COMMAND_RESULT_RECORD_VERSION;
-    snprintf(
-        record.request_id,
-        sizeof(record.request_id),
-        "%s",
-        result->request_id);
-    record.type = (uint32_t)result->type;
-    record.success = result->success ? 1 : 0;
-    snprintf(
-        record.message,
-        sizeof(record.message),
-        "%s",
-        result->message);
+    app_storage_command_result_record_t record =
+        command_result_record(result);
 
     char key[16] = {0};
     command_result_slot_key(next_slot, key, sizeof(key));
@@ -1012,7 +1374,7 @@ esp_err_t app_storage_clear_wifi_credentials(void)
 
     nvs_handle_t handle;
 
-    err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    err = app_storage_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND)
     {
         unlock_wifi_config();
@@ -1061,7 +1423,7 @@ esp_err_t app_storage_clear_wifi_credentials(void)
 esp_err_t app_storage_set_recovery_triggered(void)
 {
     nvs_handle_t handle;
-    esp_err_t err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    esp_err_t err = app_storage_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK)
     {
         return err;
@@ -1085,7 +1447,7 @@ esp_err_t app_storage_set_recovery_triggered(void)
 esp_err_t app_storage_clear_recovery_triggered(void)
 {
     nvs_handle_t handle;
-    esp_err_t err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
+    esp_err_t err = app_storage_open(APP_STORAGE_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK)
     {
         // 命名空间不存在也可以视为已经清除
@@ -1112,7 +1474,7 @@ esp_err_t app_storage_clear_recovery_triggered(void)
 bool app_storage_is_recovery_triggered(void)
 {
     nvs_handle_t handle;
-    esp_err_t err = nvs_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
+    esp_err_t err = app_storage_open(APP_STORAGE_NAMESPACE, NVS_READONLY, &handle);
     if (err != ESP_OK)
     {
         return false;
@@ -1128,7 +1490,11 @@ bool app_storage_is_recovery_triggered(void)
 esp_err_t app_storage_init_nvs(void)
 {
     //初始化nvs
+#ifdef APP_STORAGE_NVS_PARTITION
+    esp_err_t err = nvs_flash_init_partition(APP_STORAGE_NVS_PARTITION_NAME);
+#else
     esp_err_t err = nvs_flash_init();
+#endif
 
     //如果nvs分区异常就直接进行擦除
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
@@ -1136,14 +1502,22 @@ esp_err_t app_storage_init_nvs(void)
         ESP_LOGW(TAG, "NVS needs erase, reinitializing");
 
         //擦除
+#ifdef APP_STORAGE_NVS_PARTITION
+        err = nvs_flash_erase_partition(APP_STORAGE_NVS_PARTITION_NAME);
+#else
         err = nvs_flash_erase();
+#endif
         if (err != ESP_OK)
         {
             return err;
         }
 
         //重新初始化
+#ifdef APP_STORAGE_NVS_PARTITION
+        err = nvs_flash_init_partition(APP_STORAGE_NVS_PARTITION_NAME);
+#else
         err = nvs_flash_init();
+#endif
     }
     
     if (err == ESP_OK && s_wifi_config_mutex == NULL)

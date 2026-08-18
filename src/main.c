@@ -15,6 +15,7 @@
 #include "wifi_gateway.h"
 #include "device_status.h"
 #include "app_command.h"
+#include "app_command_coordinator.h"
 #include "app_mqtt.h"
 #include "client_access.h"
 #include "access_filter.h"
@@ -24,7 +25,6 @@
 
 static void handle_mqtt_command(const char *topic, int topic_len, const char *payload, int payload_len);
 static esp_err_t publish_command_result(const app_command_result_t *result);
-static esp_err_t save_and_publish_command_result(const app_command_result_t *result);
 static esp_err_t handle_wifi_provisioning(const char *ssid, const char *password);
 
 // 主题事件状态上发
@@ -505,328 +505,338 @@ static esp_err_t publish_command_result(const app_command_result_t *result)
     return app_mqtt_publish(DEVICE_COMMAND_RESULT_TOPIC, result_buffer);
 }
 
-static bool is_production_command(app_command_type_t type)
+static esp_err_t coordinator_claim(
+    void *context,
+    const char *request_id,
+    app_command_type_t type,
+    app_storage_command_claim_result_t *claim_result,
+    app_command_result_t *replay_result)
 {
-    return type >= APP_COMMAND_TYPE_ALLOW &&
-           type <= APP_COMMAND_TYPE_STAGE_WIFI_CONFIG;
+    (void)context;
+    return app_storage_claim_command(
+        request_id,
+        type,
+        claim_result,
+        replay_result);
 }
 
-static esp_err_t save_and_publish_command_result(
+static esp_err_t coordinator_complete(
+    void *context,
     const app_command_result_t *result)
 {
-    if (result != NULL &&
-        result->request_id[0] != '\0' &&
-        is_production_command(result->type))
-    {
-        esp_err_t cache_err =
-            app_storage_save_command_result(result);
-        if (cache_err != ESP_OK)
-        {
-            ESP_LOGE(
-                TAG,
-                "Save command result cache failed, type=%s, err=%s",
-                app_command_type_to_string(result->type),
-                esp_err_to_name(cache_err));
-        }
-    }
+    (void)context;
+    return app_storage_complete_command_result(result);
+}
 
+static esp_err_t coordinator_publish(
+    void *context,
+    const app_command_result_t *result)
+{
+    (void)context;
     return publish_command_result(result);
 }
 
-static void handle_mqtt_command(const char *topic, int topic_len, const char *payload, int payload_len)
-{ 
-    ESP_LOGI(TAG, "Command handler called, topic: %.*s, payload_len=%d",
-             topic_len, topic, payload_len);
-    // request 保存后端发来的命令
-    app_command_request_t request = {0};
-    // result 保存ESP32 执行后的返回结果
-    app_command_result_t result = {0};
-
-    // 解析MQTT topic 和 payload，生成命令请求
-    esp_err_t err = app_command_parse(topic,topic_len,payload,payload_len,&request);
-
-    // 无论解析是否成功，都先复制已经识别出的关联信息
-    snprintf(result.request_id, sizeof(result.request_id),"%s", request.request_id);
-    result.type = request.type;
-    result.success = false;
-
-    if (request.request_id[0] != '\0' &&
-        is_production_command(request.type))
+static esp_err_t execute_production_command(
+    void *context,
+    const app_command_request_t *request,
+    app_command_result_t *result)
+{
+    (void)context;
+    switch (request->type)
     {
-        app_command_result_t cached_result = {0};
-        esp_err_t cache_err = app_storage_load_command_result(
-            request.request_id,
-            &cached_result);
-        if (cache_err == ESP_OK)
-        {
-            ESP_LOGI(
-                TAG,
-                "Duplicate command replayed from cache, type=%s",
-                app_command_type_to_string(cached_result.type));
-            esp_err_t publish_err =
-                publish_command_result(&cached_result);
-            if (publish_err != ESP_OK)
-            {
-                ESP_LOGE(
-                    TAG,
-                    "Publish cached command result failed: %s",
-                    esp_err_to_name(publish_err));
-            }
-            return;
-        }
-        if (cache_err != ESP_ERR_NOT_FOUND)
-        {
-            snprintf(
-                result.message,
-                sizeof(result.message),
-                "%s",
-                "command result cache unavailable");
-            ESP_LOGE(
-                TAG,
-                "Read command result cache failed: %s",
-                esp_err_to_name(cache_err));
-            publish_command_result(&result);
-            return;
-        }
-    }
-
-    // 解析失败不代表可以直接结束
-    // 仍然需要发布失败结果，让后端知道命令没有被执行
-    if (err != ESP_OK)
-    {
-        snprintf(result.message,sizeof(result.message),"command parse failed: %s",esp_err_to_name(err));
-
-        ESP_LOGE(TAG,"Parse command failed: %s",esp_err_to_name(err));
-
-        esp_err_t publish_err = save_and_publish_command_result(&result);
-        if (publish_err != ESP_OK)
-        {
-            ESP_LOGE(TAG,"Publish parse failure result failed: %s",esp_err_to_name(publish_err));
-        }
-
-        return;
-    }
-
-    // 解析成功，但此时还没有执行命令
-    snprintf(result.message,sizeof(result.message),"%s","command not executed");
-
-
-    switch (request.type)
-    {
-    case APP_COMMAND_TYPE_PING:
-        // PING 不依赖其他模块，main 在这里直接完成执行
-        result.success = true;
-        
-        snprintf(result.message,sizeof(result.message),"%s","pong");
-
-        break;
-    
-    case APP_COMMAND_TYPE_GET_STATUS:
-    {
-        // 要求 device_status立即收集并发布一次真实设备状态
-        esp_err_t status_err = publish_device_status();
-        if (status_err == ESP_OK)
-        {
-            // 状态确实发布成功，此按钮把命令标记为成功
-            result.success = true;
-            snprintf(result.message, sizeof(result.message), "%s", "device status published");
-        }
-        else
-        {
-            // 状态发布失败，但仍然要发布command_result
-            // 让后端知道这条命令执行失败，而不是一直等待。
-            result.success = false;
-            snprintf(result.message, sizeof(result.message), "status publish failed: %s", esp_err_to_name(status_err));
-        
-            ESP_LOGE(TAG, "GET_STATUS failed: %s",esp_err_to_name(status_err));
-        }
-        
-        break;
-    }
-
     case APP_COMMAND_TYPE_DISCONNECT_MAC:
-        // app_command 已经解析出了MAC
-        // 现在交给wifi_gateway执行真实网络操作
-        esp_err_t disconnect_err = wifi_gateway_disconnect_client(request.mac);
-
-        if (disconnect_err == ESP_OK)
-        {
-            result.success = true;
-        
-            // ESP_OK 只证明驱动接收了断开请求
-            snprintf(result.message, sizeof(result.message), "%s", "client disconnect requested");
-        }
-        else
-        {
-            result.success = false;
-            snprintf(result.message,sizeof(result.message),"disconnect client failed: %s", esp_err_to_name(disconnect_err));
-        }
-        
-        break;
-
+    {
+        esp_err_t err = wifi_gateway_disconnect_client(request->mac);
+        result->success = err == ESP_OK;
+        snprintf(
+            result->message,
+            sizeof(result->message),
+            result->success
+                ? "client disconnect requested"
+                : "disconnect client failed");
+        return ESP_OK;
+    }
     case APP_COMMAND_TYPE_ALLOW:
     {
-        // 传入 ttl_seconds，让 client_access 记录过期时间用于后续自动撤销
-        esp_err_t authorize_err = client_access_authorize(request.mac, request.session_id, request.ttl_seconds);
-
-        if (authorize_err == ESP_OK)
-        {
-            result.success = true;
-
-            // 当前只修改访问状态，数据包放行将在下一阶段接入
-            snprintf(result.message, sizeof(result.message), "%s", "client access state authorized");
-        }
-        else
-        {
-            result.success = false;
-
-            snprintf(result.message, sizeof(result.message), "authorize client failed: %s", esp_err_to_name(authorize_err));
-        }
-
-        break;
+        esp_err_t err = client_access_authorize(
+            request->mac,
+            request->session_id,
+            request->ttl_seconds);
+        result->success = err == ESP_OK;
+        snprintf(
+            result->message,
+            sizeof(result->message),
+            result->success
+                ? "client access state authorized"
+                : "authorize client failed");
+        return ESP_OK;
     }
     case APP_COMMAND_TYPE_REVOKE_ACCESS:
     {
-        // app_command已经解析出MAC和sessionId。
-        // client_access负责核对并撤销对应的真实认证会话。
-        esp_err_t revoke_err = client_access_revoke_authorization(request.mac, request.session_id);
-
-        if (revoke_err == ESP_OK)
-        {
-            result.success = true;
-
-            // 这里只撤销外网访问权限，不断开客户端与SoftAP的连接。
-            snprintf(result.message, sizeof(result.message), "%s", "client authorization revoked");
-        }
-        else
-        {
-            result.success = false;
-
-            snprintf(result.message, sizeof(result.message), "revoke client authorization failed: %s", esp_err_to_name(revoke_err));
-        }
-
-        break;
+        esp_err_t err = client_access_revoke_authorization(
+            request->mac,
+            request->session_id);
+        result->success = err == ESP_OK;
+        snprintf(
+            result->message,
+            sizeof(result->message),
+            result->success
+                ? "client authorization revoked"
+                : "revoke client authorization failed");
+        return ESP_OK;
     }
-
     case APP_COMMAND_TYPE_KICK:
-    {
-        // KICK 是节点级安全应急复位命令
-        // 先发布 command-result 告知后端已收到，再执行设备重启
         ESP_LOGW(
             TAG,
-            "KICK command received, reason_len=%u, restarting device",
-            (unsigned)strlen(request.reason));
+            "KICK command accepted, reason_len=%u",
+            (unsigned)strlen(request->reason));
+        result->success = true;
+        snprintf(
+            result->message,
+            sizeof(result->message),
+            "%s",
+            "device restarting");
+        return ESP_OK;
+    case APP_COMMAND_TYPE_BLOCK_TRAFFIC:
+    {
+        esp_err_t err = access_filter_block_traffic(
+            request->dst_ip,
+            request->sni);
+        result->success = err == ESP_OK;
+        snprintf(
+            result->message,
+            sizeof(result->message),
+            "%s",
+            result->success
+                ? (request->sni[0] != '\0'
+                       ? "IPv4 and hostname traffic block installed"
+                       : "IPv4 traffic block installed")
+                : "block destination failed");
+        return ESP_OK;
+    }
+    case APP_COMMAND_TYPE_STAGE_WIFI_CONFIG:
+    {
+        app_storage_wifi_config_t candidate = {0};
+        snprintf(
+            candidate.request_id,
+            sizeof(candidate.request_id),
+            "%s",
+            request->request_id);
+        snprintf(
+            candidate.credentials.ssid,
+            sizeof(candidate.credentials.ssid),
+            "%s",
+            request->wifi_ssid);
+        snprintf(
+            candidate.credentials.password,
+            sizeof(candidate.credentials.password),
+            "%s",
+            request->wifi_password);
+        candidate.config_version = request->wifi_config_version;
 
+        app_storage_wifi_stage_result_t stage_result =
+            APP_STORAGE_WIFI_STAGE_STORED;
+        esp_err_t err = app_storage_stage_candidate_wifi_config(
+            &candidate,
+            &stage_result);
+        result->success =
+            err == ESP_OK &&
+            (stage_result == APP_STORAGE_WIFI_STAGE_STORED ||
+             stage_result == APP_STORAGE_WIFI_STAGE_IDEMPOTENT);
+        const char *message = "WiFi configuration storage failed";
+        if (err == ESP_OK)
+        {
+            if (stage_result == APP_STORAGE_WIFI_STAGE_STALE_VERSION)
+            {
+                message = "stale WiFi configuration version";
+            }
+            else if (stage_result == APP_STORAGE_WIFI_STAGE_VERSION_CONFLICT)
+            {
+                message = "WiFi configuration version conflict";
+            }
+            else
+            {
+                message = "candidate WiFi credentials stored";
+            }
+        }
+        snprintf(
+            result->message,
+            sizeof(result->message),
+            "%s",
+            message);
+        return ESP_OK;
+    }
+    case APP_COMMAND_TYPE_UNKNOWN:
+    case APP_COMMAND_TYPE_PING:
+    case APP_COMMAND_TYPE_GET_STATUS:
+    default:
+        return ESP_ERR_INVALID_ARG;
+    }
+}
+
+static void after_production_terminal(
+    void *context,
+    const app_command_request_t *request,
+    const app_command_result_t *result,
+    esp_err_t publish_result)
+{
+    (void)context;
+    if (request->type != APP_COMMAND_TYPE_KICK || !result->success)
+    {
+        return;
+    }
+    if (publish_result != ESP_OK)
+    {
+        ESP_LOGE(
+            TAG,
+            "Publish KICK result failed: %s",
+            esp_err_to_name(publish_result));
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+}
+
+static void handle_mqtt_command(const char *topic, int topic_len, const char *payload, int payload_len)
+{
+    ESP_LOGI(TAG, "Command handler called, topic: %.*s, payload_len=%d",
+             topic_len, topic, payload_len);
+    app_command_request_t request = {0};
+    app_command_result_t result = {0};
+    const app_command_coordinator_dependencies_t dependencies = {
+        .context = NULL,
+        .claim = coordinator_claim,
+        .complete = coordinator_complete,
+        .execute = execute_production_command,
+        .publish = coordinator_publish,
+        .after_terminal = after_production_terminal,
+    };
+
+    app_command_envelope_t envelope = {0};
+    esp_err_t envelope_err = app_command_parse_production_envelope(
+        topic,
+        topic_len,
+        payload,
+        payload_len,
+        &envelope);
+    if (envelope_err == ESP_OK)
+    {
+        esp_err_t payload_err = app_command_parse_production_payload(
+            payload,
+            payload_len,
+            &envelope,
+            &request);
+        esp_err_t coordinate_err =
+            payload_err == ESP_OK
+                ? app_command_coordinator_handle(
+                      &request,
+                      DEVICE_CODE,
+                      &dependencies)
+                : app_command_coordinator_reject_invalid_payload(
+                      &request,
+                      DEVICE_CODE,
+                      &dependencies);
+        if (payload_err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "Production command payload invalid, type=%s, err=%s",
+                app_command_type_to_string(envelope.type),
+                esp_err_to_name(payload_err));
+        }
+        if (coordinate_err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "Coordinate production command failed, type=%s, err=%s",
+                app_command_type_to_string(envelope.type),
+                esp_err_to_name(coordinate_err));
+        }
+        return;
+    }
+
+    esp_err_t err = app_command_parse(
+        topic,
+        topic_len,
+        payload,
+        payload_len,
+        &request);
+    snprintf(
+        result.request_id,
+        sizeof(result.request_id),
+        "%s",
+        request.request_id);
+    result.type = request.type;
+    result.success = false;
+
+    if (err != ESP_OK)
+    {
+        snprintf(
+            result.message,
+            sizeof(result.message),
+            "command parse failed: %s",
+            esp_err_to_name(err));
+        ESP_LOGE(TAG, "Parse command failed: %s", esp_err_to_name(err));
+        esp_err_t publish_err = publish_command_result(&result);
+        if (publish_err != ESP_OK)
+        {
+            ESP_LOGE(
+                TAG,
+                "Publish parse failure result failed: %s",
+                esp_err_to_name(publish_err));
+        }
+        return;
+    }
+
+    snprintf(
+        result.message,
+        sizeof(result.message),
+        "%s",
+        "command not executed");
+    switch (request.type)
+    {
+    case APP_COMMAND_TYPE_PING:
         result.success = true;
-        snprintf(result.message, sizeof(result.message), "%s", "device restarting");
+        snprintf(result.message, sizeof(result.message), "%s", "pong");
+        break;
 
-        esp_err_t cache_err = app_storage_save_command_result(&result);
-        if (cache_err != ESP_OK)
+    case APP_COMMAND_TYPE_GET_STATUS:
+    {
+        esp_err_t status_err = publish_device_status();
+        if (status_err == ESP_OK)
+        {
+            result.success = true;
+            snprintf(
+                result.message,
+                sizeof(result.message),
+                "%s",
+                "device status published");
+        }
+        else
         {
             result.success = false;
             snprintf(
                 result.message,
                 sizeof(result.message),
-                "%s",
-                "command result cache unavailable");
+                "status publish failed: %s",
+                esp_err_to_name(status_err));
             ESP_LOGE(
                 TAG,
-                "KICK cancelled because result cache failed: %s",
-                esp_err_to_name(cache_err));
-            publish_command_result(&result);
-            return;
-        }
-
-        esp_err_t kick_err = publish_command_result(&result);
-        if (kick_err != ESP_OK)
-        {
-            ESP_LOGE(TAG, "Publish KICK result failed: %s", esp_err_to_name(kick_err));
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        esp_restart();
-        return;
-    }
-    case APP_COMMAND_TYPE_BLOCK_TRAFFIC:
-    {
-        esp_err_t block_err = access_filter_block_traffic(
-            request.dst_ip,
-            request.sni);
-
-        if (block_err == ESP_OK)
-        {
-            result.success = true;
-            snprintf(result.message,sizeof(result.message),"%s", request.sni[0] != '\0' ? "IPv4 and hostname traffic block installed" : "IPv4 traffic block installed");
-        }
-        else
-        {
-            result.success = false;
-            snprintf(result.message, sizeof(result.message), "block destination failed: %s", esp_err_to_name(block_err));
-        }
-
-        break;
-    }
-    case APP_COMMAND_TYPE_STAGE_WIFI_CONFIG:
-    {
-        if (strcmp(request.device_code, DEVICE_CODE) != 0)
-        {
-            result.success = false;
-            snprintf(result.message, sizeof(result.message), "%s", "device code mismatch");
-            break;
-        }
-
-        app_storage_wifi_config_t candidate = {0};
-        snprintf(candidate.request_id, sizeof(candidate.request_id), "%s", request.request_id);
-        snprintf(candidate.credentials.ssid, sizeof(candidate.credentials.ssid), "%s", request.wifi_ssid);
-        snprintf(candidate.credentials.password, sizeof(candidate.credentials.password), "%s", request.wifi_password);
-        candidate.config_version = request.wifi_config_version;
-
-        app_storage_wifi_stage_result_t stage_result = APP_STORAGE_WIFI_STAGE_STORED;
-        esp_err_t stage_err = app_storage_stage_candidate_wifi_config(
-            &candidate,
-            &stage_result);
-        if (stage_err != ESP_OK)
-        {
-            result.success = false;
-            snprintf(result.message, sizeof(result.message), "%s",
-                     "WiFi configuration storage failed");
-            ESP_LOGE(TAG, "Stage WiFi configuration failed: %s", esp_err_to_name(stage_err));
-        }
-        else if (stage_result == APP_STORAGE_WIFI_STAGE_STALE_VERSION)
-        {
-            result.success = false;
-            snprintf(result.message, sizeof(result.message), "%s",
-                     "stale WiFi configuration version");
-        }
-        else if (stage_result == APP_STORAGE_WIFI_STAGE_VERSION_CONFLICT)
-        {
-            result.success = false;
-            snprintf(result.message, sizeof(result.message), "%s",
-                     "WiFi configuration version conflict");
-        }
-        else
-        {
-            result.success = true;
-            snprintf(result.message, sizeof(result.message), "%s",
-                     "candidate WiFi credentials stored");
+                "GET_STATUS failed: %s",
+                esp_err_to_name(status_err));
         }
         break;
     }
     case APP_COMMAND_TYPE_UNKNOWN:
     default:
-        // 理论上未知命令已经被app_command_handle拦截了，这里是额外的安全保护。
         ESP_LOGE(TAG, "Unsupported command type");
         return;
     }
 
-    err = save_and_publish_command_result(&result);
+    err = publish_command_result(&result);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Publish command result failed: %s", esp_err_to_name(err));
-        return;
     }
-    
-    
 }
 
 // 将断线快照序列化并发布给后端。

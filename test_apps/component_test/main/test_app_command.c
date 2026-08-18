@@ -2,8 +2,6 @@
 
 #include "app_command.h"
 #include "esp_err.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "unity.h"
 
 static esp_err_t parse_command(
@@ -19,15 +17,7 @@ static esp_err_t parse_command(
         request);
 }
 
-void setUp(void)
-{
-}
-
-void tearDown(void)
-{
-}
-
-static void test_allow_command_preserves_contract_fields(void)
+TEST_CASE("test_allow_command_preserves_contract_fields", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/allow";
     const char *payload =
@@ -40,6 +30,7 @@ static void test_allow_command_preserves_contract_fields(void)
     TEST_ASSERT_EQUAL(ESP_OK, parse_command(topic, payload, &request));
     TEST_ASSERT_EQUAL(APP_COMMAND_TYPE_ALLOW, request.type);
     TEST_ASSERT_EQUAL_STRING("req-allow-1", request.request_id);
+    TEST_ASSERT_EQUAL_STRING("demo", request.device_code);
     TEST_ASSERT_EQUAL_STRING("AA:BB:CC:DD:EE:FF", request.mac);
     TEST_ASSERT_TRUE_MESSAGE(
         request.session_id == 42,
@@ -49,7 +40,7 @@ static void test_allow_command_preserves_contract_fields(void)
         "ttlSeconds mismatch");
 }
 
-static void test_allow_command_rejects_zero_ttl(void)
+TEST_CASE("test_allow_command_rejects_zero_ttl", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/allow";
     const char *payload =
@@ -65,7 +56,7 @@ static void test_allow_command_rejects_zero_ttl(void)
     TEST_ASSERT_EQUAL(APP_COMMAND_TYPE_ALLOW, request.type);
 }
 
-static void test_revoke_access_command_preserves_contract_fields(void)
+TEST_CASE("test_revoke_access_command_preserves_contract_fields", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/revoke-access";
     const char *payload =
@@ -77,13 +68,14 @@ static void test_revoke_access_command_preserves_contract_fields(void)
     TEST_ASSERT_EQUAL(ESP_OK, parse_command(topic, payload, &request));
     TEST_ASSERT_EQUAL(APP_COMMAND_TYPE_REVOKE_ACCESS, request.type);
     TEST_ASSERT_EQUAL_STRING("req-revoke-v1", request.request_id);
+    TEST_ASSERT_EQUAL_STRING("demo", request.device_code);
     TEST_ASSERT_EQUAL_STRING("AA:BB:CC:DD:EE:FF", request.mac);
     TEST_ASSERT_TRUE_MESSAGE(
         request.session_id == 42,
         "sessionId mismatch");
 }
 
-static void test_kick_command_uses_independent_reason_buffer(void)
+TEST_CASE("test_kick_command_uses_independent_reason_buffer", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/kick";
     const char *payload =
@@ -100,7 +92,7 @@ static void test_kick_command_uses_independent_reason_buffer(void)
     TEST_ASSERT_EQUAL_STRING("", request.mac);
 }
 
-static void test_kick_command_rejects_topic_payload_device_mismatch(void)
+TEST_CASE("test_kick_command_rejects_topic_payload_device_mismatch", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/kick";
     const char *payload =
@@ -115,7 +107,7 @@ static void test_kick_command_rejects_topic_payload_device_mismatch(void)
     TEST_ASSERT_EQUAL(APP_COMMAND_TYPE_KICK, request.type);
 }
 
-static void test_kick_command_rejects_missing_device_code(void)
+TEST_CASE("test_kick_command_rejects_missing_device_code", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/kick";
     const char *payload =
@@ -129,7 +121,7 @@ static void test_kick_command_rejects_missing_device_code(void)
     TEST_ASSERT_EQUAL(APP_COMMAND_TYPE_KICK, request.type);
 }
 
-static void test_disconnect_mac_command_preserves_contract_fields(void)
+TEST_CASE("test_disconnect_mac_command_preserves_contract_fields", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/disconnect-mac";
     const char *payload =
@@ -141,13 +133,14 @@ static void test_disconnect_mac_command_preserves_contract_fields(void)
     TEST_ASSERT_EQUAL(ESP_OK, parse_command(topic, payload, &request));
     TEST_ASSERT_EQUAL(APP_COMMAND_TYPE_DISCONNECT_MAC, request.type);
     TEST_ASSERT_EQUAL_STRING("req-disconnect-v1", request.request_id);
+    TEST_ASSERT_EQUAL_STRING("demo", request.device_code);
     TEST_ASSERT_EQUAL_STRING("AA:BB:CC:DD:EE:FF", request.mac);
     TEST_ASSERT_TRUE_MESSAGE(
         request.alert_id == 0,
         "alertId mismatch");
 }
 
-static void test_block_traffic_command_preserves_contract_fields(void)
+TEST_CASE("test_block_traffic_command_preserves_contract_fields", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/block-traffic";
     const char *payload =
@@ -160,6 +153,7 @@ static void test_block_traffic_command_preserves_contract_fields(void)
     TEST_ASSERT_EQUAL(ESP_OK, parse_command(topic, payload, &request));
     TEST_ASSERT_EQUAL(APP_COMMAND_TYPE_BLOCK_TRAFFIC, request.type);
     TEST_ASSERT_EQUAL_STRING("req-block-v1", request.request_id);
+    TEST_ASSERT_EQUAL_STRING("demo", request.device_code);
     TEST_ASSERT_EQUAL_STRING("203.0.113.10", request.dst_ip);
     TEST_ASSERT_EQUAL_STRING("blocked.test", request.sni);
     TEST_ASSERT_TRUE_MESSAGE(
@@ -167,7 +161,7 @@ static void test_block_traffic_command_preserves_contract_fields(void)
         "alertId mismatch");
 }
 
-static void test_stage_wifi_command_requires_complete_candidate(void)
+TEST_CASE("test_stage_wifi_command_requires_complete_candidate", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/stage-wifi-config";
     const char *payload =
@@ -189,7 +183,7 @@ static void test_stage_wifi_command_requires_complete_candidate(void)
     TEST_ASSERT_EQUAL_UINT32(7, request.wifi_config_version);
 }
 
-static void test_stage_wifi_command_rejects_missing_request_id(void)
+TEST_CASE("test_stage_wifi_command_rejects_missing_request_id", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/stage-wifi-config";
     const char *payload =
@@ -204,7 +198,7 @@ static void test_stage_wifi_command_rejects_missing_request_id(void)
         parse_command(topic, payload, &request));
 }
 
-static void test_stage_wifi_command_rejects_zero_config_version(void)
+TEST_CASE("test_stage_wifi_command_rejects_zero_config_version", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/stage-wifi-config";
     const char *payload =
@@ -220,7 +214,7 @@ static void test_stage_wifi_command_rejects_zero_config_version(void)
         parse_command(topic, payload, &request));
 }
 
-static void test_stage_wifi_command_rejects_topic_payload_device_mismatch(void)
+TEST_CASE("test_stage_wifi_command_rejects_topic_payload_device_mismatch", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/stage-wifi-config";
     const char *payload =
@@ -237,7 +231,7 @@ static void test_stage_wifi_command_rejects_topic_payload_device_mismatch(void)
     TEST_ASSERT_EQUAL(APP_COMMAND_TYPE_STAGE_WIFI_CONFIG, request.type);
 }
 
-static void test_allow_command_rejects_wrong_ttl_type(void)
+TEST_CASE("test_allow_command_rejects_wrong_ttl_type", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/allow";
     const char *payload =
@@ -252,7 +246,7 @@ static void test_allow_command_rejects_wrong_ttl_type(void)
         parse_command(topic, payload, &request));
 }
 
-static void test_command_rejects_request_id_over_visible_limit(void)
+TEST_CASE("test_command_rejects_request_id_over_visible_limit", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/allow";
     const char *payload =
@@ -268,7 +262,7 @@ static void test_command_rejects_request_id_over_visible_limit(void)
         parse_command(topic, payload, &request));
 }
 
-static void test_repeated_request_id_parses_to_same_command_identity(void)
+TEST_CASE("test_repeated_request_id_parses_to_same_command_identity", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/allow";
     const char *payload =
@@ -288,7 +282,121 @@ static void test_repeated_request_id_parses_to_same_command_identity(void)
         "repeated sessionId mismatch");
 }
 
-static void test_unknown_topic_does_not_become_production_command(void)
+TEST_CASE("test_command_target_requires_exact_local_device", "[h1][app_command]")
+{
+    const char *topic = "wifi/device/demo/cmd/allow";
+    const char *payload =
+        "{\"requestId\":\"req-device-target-v1\","
+        "\"mac\":\"AA:BB:CC:DD:EE:FF\","
+        "\"sessionId\":42,"
+        "\"ttlSeconds\":60}";
+    app_command_request_t request = {0};
+
+    TEST_ASSERT_EQUAL(ESP_OK, parse_command(topic, payload, &request));
+    TEST_ASSERT_TRUE(app_command_targets_device(&request, "demo"));
+    TEST_ASSERT_FALSE(app_command_targets_device(&request, "other-device"));
+    TEST_ASSERT_FALSE(app_command_targets_device(&request, ""));
+}
+
+TEST_CASE("test_invalid_allow_payload_preserves_complete_envelope", "[h1][app_command]")
+{
+    const char *topic =
+        "wifi/device/esp32-gateway-001/cmd/allow";
+    const char *payload =
+        "{\"requestId\":\"req-malformed-v1\","
+        "\"mac\":\"AA:BB:CC:DD:EE:FF\","
+        "\"sessionId\":42,"
+        "\"ttlSeconds\":0}";
+    app_command_envelope_t envelope = {0};
+    app_command_request_t request = {0};
+
+    TEST_ASSERT_EQUAL(
+        ESP_OK,
+        app_command_parse_production_envelope(
+            topic,
+            (int)strlen(topic),
+            payload,
+            (int)strlen(payload),
+            &envelope));
+    TEST_ASSERT_EQUAL(APP_COMMAND_TYPE_ALLOW, envelope.type);
+    TEST_ASSERT_EQUAL_STRING("req-malformed-v1", envelope.request_id);
+    TEST_ASSERT_EQUAL_STRING(
+        "esp32-gateway-001",
+        envelope.device_code);
+    TEST_ASSERT_EQUAL(
+        ESP_ERR_INVALID_ARG,
+        app_command_parse_production_payload(
+            payload,
+            (int)strlen(payload),
+            &envelope,
+            &request));
+    TEST_ASSERT_EQUAL(APP_COMMAND_TYPE_ALLOW, request.type);
+    TEST_ASSERT_EQUAL_STRING(envelope.request_id, request.request_id);
+    TEST_ASSERT_EQUAL_STRING(envelope.device_code, request.device_code);
+}
+
+TEST_CASE("test_invalid_wifi_config_preserves_complete_envelope", "[h1][app_command]")
+{
+    const char *topic =
+        "wifi/device/esp32-gateway-001/cmd/stage-wifi-config";
+    const char *payload =
+        "{\"requestId\":\"req-invalid-config-v1\","
+        "\"deviceCode\":\"esp32-gateway-001\","
+        "\"ssid\":\"DemoWifi\","
+        "\"password\":\"invalid-test-password\","
+        "\"configVersion\":0}";
+    app_command_envelope_t envelope = {0};
+    app_command_request_t request = {0};
+
+    TEST_ASSERT_EQUAL(
+        ESP_OK,
+        app_command_parse_production_envelope(
+            topic,
+            (int)strlen(topic),
+            payload,
+            (int)strlen(payload),
+            &envelope));
+    TEST_ASSERT_EQUAL(
+        APP_COMMAND_TYPE_STAGE_WIFI_CONFIG,
+        envelope.type);
+    TEST_ASSERT_EQUAL(
+        ESP_ERR_INVALID_ARG,
+        app_command_parse_production_payload(
+            payload,
+            (int)strlen(payload),
+            &envelope,
+            &request));
+    TEST_ASSERT_EQUAL_STRING(
+        "esp32-gateway-001",
+        request.device_code);
+}
+
+TEST_CASE("test_missing_request_id_is_not_claimable_envelope", "[h1][app_command]")
+{
+    const char *topic =
+        "wifi/device/esp32-gateway-001/cmd/allow";
+    const char *payload =
+        "{\"mac\":\"AA:BB:CC:DD:EE:FF\","
+        "\"sessionId\":42,"
+        "\"ttlSeconds\":60}";
+    app_command_envelope_t envelope = {0};
+
+    TEST_ASSERT_EQUAL(
+        ESP_ERR_INVALID_ARG,
+        app_command_parse_production_envelope(
+            topic,
+            (int)strlen(topic),
+            payload,
+            (int)strlen(payload),
+            &envelope));
+    TEST_ASSERT_EQUAL(APP_COMMAND_TYPE_ALLOW, envelope.type);
+    TEST_ASSERT_EQUAL_STRING(
+        "esp32-gateway-001",
+        envelope.device_code);
+    TEST_ASSERT_EQUAL_STRING("", envelope.request_id);
+}
+
+TEST_CASE("test_unknown_topic_does_not_become_production_command", "[h1][app_command]")
 {
     const char *topic = "wifi/device/demo/cmd/not-supported";
     const char *payload = "{\"requestId\":\"req-unknown-1\"}";
@@ -298,28 +406,4 @@ static void test_unknown_topic_does_not_become_production_command(void)
         ESP_ERR_NOT_FOUND,
         parse_command(topic, payload, &request));
     TEST_ASSERT_EQUAL(APP_COMMAND_TYPE_UNKNOWN, request.type);
-}
-
-void app_main(void)
-{
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    UNITY_BEGIN();
-    RUN_TEST(test_allow_command_preserves_contract_fields);
-    RUN_TEST(test_allow_command_rejects_zero_ttl);
-    RUN_TEST(test_revoke_access_command_preserves_contract_fields);
-    RUN_TEST(test_kick_command_uses_independent_reason_buffer);
-    RUN_TEST(test_kick_command_rejects_topic_payload_device_mismatch);
-    RUN_TEST(test_kick_command_rejects_missing_device_code);
-    RUN_TEST(test_disconnect_mac_command_preserves_contract_fields);
-    RUN_TEST(test_block_traffic_command_preserves_contract_fields);
-    RUN_TEST(test_stage_wifi_command_requires_complete_candidate);
-    RUN_TEST(test_stage_wifi_command_rejects_missing_request_id);
-    RUN_TEST(test_stage_wifi_command_rejects_zero_config_version);
-    RUN_TEST(test_stage_wifi_command_rejects_topic_payload_device_mismatch);
-    RUN_TEST(test_allow_command_rejects_wrong_ttl_type);
-    RUN_TEST(test_command_rejects_request_id_over_visible_limit);
-    RUN_TEST(test_repeated_request_id_parses_to_same_command_identity);
-    RUN_TEST(test_unknown_topic_does_not_become_production_command);
-    UNITY_END();
 }

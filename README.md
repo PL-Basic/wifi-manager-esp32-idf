@@ -49,11 +49,16 @@ components/
   portal_dns.c/h               #   Portal DNS、上游解析与 hostname 策略拒绝
   app_mqtt/                    # MQTT 连接、发布、订阅、命令回调分发
   app_command/                 # 从 MQTT topic 识别命令类型，解析 JSON payload
+  app_command_coordinator/     # 命令 claim、执行、终态保存与发布顺序
   device_status/               # 设备状态快照与 JSON 序列化
   app_storage/                 # NVS 凭据存储、恢复标记、重试计数器
 
 include/env/
   secrets.example.h            # 配置模板（复制为 secrets.h 后填写）
+
+tests/host/                    # H0：纯 C 逻辑测试，CMake/CTest
+test_apps/component_test/      # H1：单一最小 ESP32 组件测试应用
+tests/hil/                     # H2：生产固件真机场景与证据索引
 ```
 
 ## 快速开始
@@ -96,6 +101,14 @@ VS Code 底部状态栏 PlatformIO 工具栏：
 - **串口监视**：点击 🔌（Monitor）
 
 首次配网时设备没有上游凭据，会自动启动配网热点 `WifiManager-Setup`。手机连接后浏览器访问 `http://192.168.4.1/` 输入上游 WiFi 凭据即可。
+
+### 测试分层
+
+固件验证按 H0 Host、H1 单一组件测试应用、H2 生产固件 HIL 分层。业务改动
+按受影响行为选择测试，不按阶段号创建新的 PlatformIO 环境或构建目录。
+
+具体入口见 `tests/README.md`。H1 构建、上传和串口验证只能在固件组合门获得
+明确授权后执行。
 
 ## 配网流程
 

@@ -1,0 +1,16 @@
+idf_component_register(
+    SRCS
+        "test_app_main.c"
+        "test_app_command.c"
+        "test_app_command_coordinator.c"
+        "test_app_storage.c"
+    PRIV_REQUIRES
+        unity
+        app_command
+        app_command_coordinator
+        app_storage
+        nvs_flash
+        esp_partition
+        esp_system
+    WHOLE_ARCHIVE
+)
